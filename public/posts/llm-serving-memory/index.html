@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>70B는 왜 A100 한 장에 안 들어갈까: GPU 메모리와 양자화 · naelog</title>
+  <meta name="description" content="GPU 메모리를 가중치, KV cache, 오버헤드로 나눠 계산하고, GPU 세대에 맞는 양자화를 고르는 법을 정리한 LLM 서빙 1편입니다." />
+  <!-- 홈 목록에 쓰이는 정보 -->
+  <meta name="post:log" content="dev" />
+  <meta name="post:date" content="2026-11-23" />
+  <meta name="post:series" content="LLM 서빙" />
+  <meta name="post:part" content="1" />
+  <meta name="post:category" content="GPU와 추론" />
+  <meta name="post:tags" content="LLM 서빙, vLLM, Quantization, KV Cache" />
+  <link rel="stylesheet" href="../../assets/naedevlog.css" />
+  <link rel="alternate" hreflang="en" href="../../en/posts/llm-serving-memory/" />
+  <script src="../../assets/site.js"></script>
+  <style>
+    /* 설명이 긴 표는 칸 안에서 줄바꿈한다 */
+    .table-wrap td:not(.num) { white-space: normal; min-width: 7em; }
+    .table-wrap th { white-space: nowrap; }
+    .ctrls { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 14px 18px; margin-bottom: 20px; }
+    .ctrls label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; color: var(--sub); }
+    .verdict { border-radius: 12px; padding: 14px 18px; margin: 4px 0 18px; font-size: 15px; line-height: 1.6; }
+    .verdict .pill { margin-right: 6px; }
+    .verdict.ok { background: var(--blue-soft); color: var(--blue); }
+    .verdict.warn, .verdict.bad { background: var(--warn-soft); color: var(--warn); }
+    .cap { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 13px; color: var(--faint); }
+    .bar { display: flex; height: 28px; border-radius: 8px; overflow: hidden; background: var(--surface-2); margin: 6px 0 0; }
+    .bar i { display: block; height: 100%; transition: width .25s; }
+    .bar .w { background: var(--blue); } .bar .o { background: var(--gray-bar); }
+    .bar .kv { background: var(--blue-light); } .bar .over { background: var(--warn); }
+    .bar-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; color: var(--sub); margin-top: 10px; }
+    .bar-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; margin-top: 18px; }
+    .stat { background: var(--bg); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+    .stat small { display: block; font-size: 12.5px; color: var(--faint); font-weight: 600; }
+    .stat b { font-size: 20px; font-weight: 800; font-variant-numeric: tabular-nums; }
+    .stat em { font-style: normal; font-size: 12.5px; color: var(--sub); margin-left: 3px; }
+    .fine { font-size: 13px; color: var(--faint); margin: 14px 0 0; }
+  </style>
+</head>
+<body>
+  <header class="site-header"><div class="inner">
+    <a class="logo" href="../../">naelog</a>
+    <nav class="nav">
+      <a href="../../dev/" aria-current="page">dev</a>
+      <a href="../../book/">book</a>
+      <a href="../../scrap/">scrap</a>
+    </nav>
+  </div></header>
+
+  <main class="wrap">
+    <div class="category">LLM 서빙 · 1편</div>
+    <h1>70B는 왜 A100 한 장에 안 들어갈까: GPU 메모리와 양자화</h1>
+    <p class="lead"><code>vllm serve</code> 한 줄이 돌아가는 것과 서비스로 버티는 것은 다른 일입니다. 1편은 그 첫 관문인 GPU 메모리 계산과, 메모리를 줄이는 양자화를 다룹니다.</p>
+    <div class="post-meta">
+      <span>2026.11.23</span><span class="dot"></span><span>15분</span>
+      <span class="tag">LLM 서빙</span><span class="tag">vLLM</span><span class="tag">Quantization</span><span class="tag">KV Cache</span>
+    </div>
+
+    <nav class="series" aria-label="LLM 서빙 시리즈">
+      <div class="series-label">LLM 서빙 학습 노트 · 3편</div>
+      <a href="../llm-serving-memory/" aria-current="page"><span>1편 · 지금 읽는 중</span>메모리와 양자화<small>70B는 왜 A100 한 장에 안 들어갈까</small></a>
+      <a href="../llm-serving-runtime/"><span>2편</span>GPU 위에서 모델이 돌아가는 방식<small>답은 왜 한 글자씩 나올까</small></a>
+      <a href="../llm-serving-operations/"><span>3편</span>성능과 운영<small>사용자가 100명이 되면 무엇이 먼저 무너질까</small></a>
+    </nav>
+
+    <p>이번 편의 질문은 하나입니다. <strong>"이 모델이 이 GPU에 들어가는가, 들어간다면 몇 명분 자리가 남는가?"</strong> OOM(메모리 부족) 에러의 대부분은 이 질문에 숫자로 답하지 않고 띄웠을 때 납니다.</p>
+    <ol>
+    <li><strong>메모리</strong>: GPU 메모리를 가중치·KV cache·오버헤드 세 덩어리로 나눠 계산</li>
+    <li><strong>양자화</strong>: 숫자를 더 적은 비트로 저장해 메모리를 줄이는 방법과 GPU별 선택</li>
+    <li><strong>계산기</strong>: 조건을 바꿔 가며 OOM이 나는 지점을 직접 확인</li>
+    <li><strong>사례</strong>: 실제로 자주 겪는 두 상황에 적용</li>
+    </ol>
+    <p>이 편을 다 읽으면 "70B를 A100 한 장에 BF16으로 못 올리는 이유"를 곱셈으로 설명할 수 있습니다. 모르는 약자는 맨 아래 <a href="#glossary">용어 사전</a>에 있습니다.</p>
+    <h2>GPU 메모리와 모델 크기의 관계</h2>
+    <p>VRAM은 가중치, KV cache, 그 밖의 오버헤드 세 덩어리로 나뉩니다. 첫 번째만 계산하면 반드시 틀립니다.</p>
+    <div class="callout info">
+    <span class="label">쉽게 말하면 · GPU 메모리는 책상이다</span>
+    <p>GPU 메모리(VRAM)를 <strong>책상</strong>이라고 생각해 보세요. 이 책상 위에 세 가지를 올려야 합니다.</p>
+    <div class="table-wrap"><table>
+    <tr><th>덩어리</th><th>비유</th><th>하는 일</th></tr>
+    <tr><td><strong>가중치</strong></td><td>두꺼운 백과사전</td><td>모델이 배운 지식 그 자체</td></tr>
+    <tr><td><strong>KV cache</strong></td><td>대화 메모장</td><td>지금까지 나눈 대화를 적어 두는 공간</td></tr>
+    <tr><td><strong>오버헤드</strong></td><td>필기도구, 스탠드</td><td>프로그램이 돌아가는 데 필요한 잡다한 것 (2~4GB)</td></tr>
+    </table></div>
+    <p>책상이 작으면 백과사전부터 안 올라가고(로딩 OOM), 백과사전은 올렸는데 메모장 놓을 자리가 없으면 사람을 받을 수 없습니다(KV 부족).</p>
+    </div>
+
+    <h3>가중치: 파라미터 수 × 파라미터당 바이트</h3>
+    <div class="formula">가중치 메모리 = <b>파라미터 수</b> × <b>바이트/파라미터</b></div>
+    <div class="table-wrap"><table>
+    <tr><th>모델</th><th>BF16 (2B)</th><th>FP8 / INT8 (1B)</th><th>INT4 (≈0.55B, 스케일 포함)</th></tr>
+    <tr><td>8B</td><td class="num">16 GB</td><td class="num">8 GB</td><td class="num">4.4 GB</td></tr>
+    <tr><td>32B</td><td class="num">64 GB</td><td class="num">32 GB</td><td class="num">17.6 GB</td></tr>
+    <tr><td>70B</td><td class="num">140 GB</td><td class="num">70 GB</td><td class="num">38.5 GB</td></tr>
+    <tr><td>405B</td><td class="num">810 GB</td><td class="num">405 GB</td><td class="num">223 GB</td></tr>
+    </table></div>
+    <p>"70B"는 파라미터(모델이 학습한 숫자)가 700억(70 Billion) 개라는 뜻이고, 표 머리글의 2B·1B는 파라미터 하나가 차지하는 바이트입니다. 그래서 70B를 BF16으로 올리면 <code>700억 × 2바이트 = 140GB</code>, 가중치만 140GB입니다. 80GB 카드 한 장에는 처음부터 들어가지 않습니다. 설정을 잘못한 게 아니라 산수로 안 되는 상황이고, 이것이 가장 흔한 OOM의 정체입니다.</p>
+
+    <h3>KV cache: 동시 요청과 컨텍스트 길이에 비례</h3>
+    <p>KV cache를 이해하려면 모델이 어떻게 생겼는지 먼저 조금 알아야 합니다. ChatGPT, Llama, Claude, Qwen 등 지금 거의 모든 LLM은 <strong>Transformer</strong>라는 설계 구조를 씁니다. GPT의 T도 Transformer(Generative Pre-trained Transformer)이고, 2017년 Google 논문 "Attention Is All You Need"에서 처음 나왔습니다.</p>
+    <p>Transformer는 같은 모양의 <strong>층(레이어)을 수십 개 쌓은 구조</strong>입니다. Llama 3.1 70B는 80층입니다. 토큰이 아래층부터 차례로 올라가며 점점 깊이 이해되고, 맨 위층에서 다음에 올 토큰을 고릅니다. 각 층은 <strong>attention</strong>으로 앞에 나온 토큰 중 무엇을 참고할지 살피고, <strong>feed-forward</strong>로 그 내용을 가공합니다. attention은 도서관에서 자료를 찾는 방식과 비슷해서, 토큰마다 세 가지 값을 만들어 씁니다.</p>
+    <div class="table-wrap"><table>
+    <tr><th>값</th><th>도서관에 비유하면</th><th>역할</th></tr>
+    <tr><td><strong>Query</strong></td><td>내가 찾는 질문</td><td>"지금 나는 이런 정보가 필요해"</td></tr>
+    <tr><td><strong>Key</strong></td><td>책 등에 붙은 제목표</td><td>"나는 이런 내용을 담고 있어"</td></tr>
+    <tr><td><strong>Value</strong></td><td>책의 실제 내용</td><td>찾았을 때 가져가는 정보</td></tr>
+    </table></div>
+    <p>"철수는 사과를 샀다. 그는…"에서 "그는"을 처리할 때, "그는"의 Query를 앞 토큰들의 Key와 하나씩 맞춰 보면 "철수"가 가장 잘 맞습니다. 그래서 철수의 Value를 가져와 "그 = 철수"라고 이해합니다.</p>
+    <p>즉 새 토큰을 하나 만들 때마다 <strong>앞 토큰들의 Key와 Value가 전부 필요</strong>합니다. 매번 다시 계산하면 낭비이므로, Transformer는 이미 처리한 토큰의 Key·Value를 레이어마다 저장해 두고 재사용합니다. 이 저장 공간이 <strong>KV cache</strong>, 위 비유의 대화 메모장입니다. 80개 층이 각자 따로 Key·Value를 만들기 때문에 아래 식에 레이어 수가 곱해집니다. 그리고 대화가 길수록 메모장이 두꺼워지고 사용자가 많을수록 메모장 개수가 늘어나서, 전체 크기는 길이와 사용자 수에 비례해 커집니다.</p>
+    <div class="formula">토큰당 KV = 2(K,V) × <b>레이어 수</b> × <b>KV 헤드 수</b> × <b>헤드 차원</b> × <b>바이트</b></div>
+    <p>Llama 3.1 70B(80 레이어, KV 헤드 8개, 헤드 차원 128, BF16)를 넣으면 토큰당 <code>2×80×8×128×2 = 327,680 B</code>, 약 0.33MB입니다.</p>
+    <div class="table-wrap"><table>
+    <tr><th>70B, BF16 KV</th><th>요청 1개</th><th>동시 16개</th><th>동시 64개</th></tr>
+    <tr><td>컨텍스트 4K</td><td class="num">1.3 GB</td><td class="num">21 GB</td><td class="num">86 GB</td></tr>
+    <tr><td>컨텍스트 8K</td><td class="num">2.7 GB</td><td class="num">43 GB</td><td class="num">172 GB</td></tr>
+    <tr><td>컨텍스트 32K</td><td class="num">10.7 GB</td><td class="num">172 GB</td><td class="num">687 GB</td></tr>
+    </table></div>
+    <p>8K 대화 하나는 2.7GB지만 64명이 동시에 쓰면 172GB가 됩니다. 가중치가 겨우 들어가도 메모장 놓을 자리가 없으면 서비스가 되지 않습니다. 반대로 KV를 충분히 확보하는 것이 곧 동시 처리량입니다.</p>
+
+    <h3>오버헤드: 잊기 쉬운 2~4GB</h3>
+    <ul>
+    <li><strong>CUDA context</strong>: 프로세스가 GPU를 잡는 순간 0.5~1GB</li>
+    <li><strong>활성값(activation)</strong>: prefill 중 중간 텐서. 긴 프롬프트를 한 번에 처리할수록 커짐</li>
+    <li><strong>CUDA graph</strong>: vLLM이 decode 속도를 위해 미리 캡처하는 그래프, 수백 MB~수 GB</li>
+    <li><strong>다른 프로세스</strong>: 같은 GPU에 떠 있는 임베딩 서버, 주피터 커널 등. <code>nvidia-smi</code>로 먼저 확인</li>
+    </ul>
+    <figure class="figure">
+      <svg viewBox="0 0 700 190" role="img" aria-label="A100 80GB에 70B INT4를 올렸을 때 메모리 구성" font-family="Pretendard Variable, Pretendard, sans-serif">
+        <text x="0" y="16" fill="#4e5968" font-size="14" font-weight="600">A100 80GB · 70B INT4 예시</text>
+        <g transform="translate(0,36)">
+          <!-- 700px = 80GB -->
+          <rect x="0" y="0" width="700" height="52" rx="8" fill="#f2f4f6"/>
+          <rect x="0" y="0" width="337" height="52" rx="8" fill="#3182f6"/>
+          <rect x="325" y="0" width="12" height="52" fill="#3182f6"/>
+          <rect x="337" y="0" width="26" height="52" fill="#b0b8c1"/>
+          <rect x="363" y="0" width="267" height="52" fill="#90c2ff"/>
+          <text x="18" y="32" fill="#fff" font-size="15" font-weight="700">가중치 38.5GB</text>
+          <text x="496" y="32" fill="#191f28" font-size="14" font-weight="700" text-anchor="middle">KV cache ≈30GB</text>
+          <text x="665" y="32" fill="#8b95a1" font-size="13" font-weight="700" text-anchor="middle">8</text>
+          <path d="M0 66 v8 h630 v-8" fill="none" stroke="#b0b8c1" stroke-width="1.5"/>
+          <text x="315" y="94" fill="#4e5968" font-size="13" text-anchor="middle">gpu-memory-utilization 0.9 = 72GB까지 사용</text>
+          <path d="M633 66 v8 h67 v-8" fill="none" stroke="#d1d6db" stroke-width="1.5"/>
+          <text x="666" y="94" fill="#8b95a1" font-size="12" text-anchor="middle">예약 안 함</text>
+        </g>
+        <g transform="translate(0,160)" font-size="14" fill="#4e5968">
+          <rect x="0" y="0" width="12" height="12" rx="3" fill="#3182f6"/><text x="20" y="11">가중치</text>
+          <rect x="110" y="0" width="12" height="12" rx="3" fill="#b0b8c1"/><text x="130" y="11">오버헤드 ≈3GB</text>
+          <rect x="270" y="0" width="12" height="12" rx="3" fill="#90c2ff"/><text x="290" y="11">KV cache</text>
+          <rect x="400" y="0" width="12" height="12" rx="3" fill="#f2f4f6" stroke="#d1d6db"/><text x="420" y="11">예약 안 함 8GB</text>
+        </g>
+      </svg>
+      <figcaption>가중치와 오버헤드를 빼고 남은 자리가 KV cache, 곧 동시에 받을 수 있는 사람 수입니다.</figcaption>
+    </figure>
+
+    <h2>Quantization</h2>
+    <p>가중치(필요하면 활성값과 KV까지)를 더 적은 비트로 표현해 메모리와 대역폭을 줄이는 기법입니다. 선택 기준은 GPU 세대, 품질 허용치, 서빙 엔진 지원 여부 세 가지입니다.</p>
+    <div class="callout info">
+    <span class="label">쉽게 말하면 · 양자화는 사진 압축이다</span>
+    <p>고화질 사진을 JPG로 압축하면 용량이 확 줄고, 눈으로 보면 거의 차이가 없습니다. 양자화도 같습니다. 숫자 하나를 16비트 대신 8비트나 4비트로 저장해서, 70B 모델이 140GB에서 70GB, 약 38.5GB로 줄어듭니다.</p>
+    <p>다만 압축한 사진이 원본과 똑같은 사진은 아니듯, 많이 줄일수록 세부가 조금씩 뭉개집니다. 그래서 어떤 형식을 쓸 수 있는지는 GPU 세대가 정하고, 얼마나 줄여도 되는지는 실제 업무 질문으로 확인해서 정합니다.</p>
+    </div>
+    <div class="table-wrap"><table>
+    <tr><th>방식</th><th>비트</th><th>무엇을 줄이나</th><th>품질</th><th>맞는 GPU</th></tr>
+    <tr><td>BF16 / FP16</td><td class="num">16</td><td>기준</td><td>원본</td><td>전부</td></tr>
+    <tr><td>FP8 (W8A8)</td><td class="num">8</td><td>가중치·활성값, 연산도 FP8</td><td>거의 무손실</td><td>Ada(L40S, 4090), Hopper(H100/H200), Blackwell</td></tr>
+    <tr><td>INT8 W8A8 (SmoothQuant)</td><td class="num">8</td><td>가중치·활성값</td><td>거의 무손실</td><td>Ampere(A100, A6000)</td></tr>
+    <tr><td>AWQ / GPTQ (W4A16)</td><td class="num">4</td><td>가중치만, 연산은 FP16</td><td>약간 손실, 수학·코드에서 먼저 드러남</td><td>전부, Marlin 커널로 빠름</td></tr>
+    <tr><td>NVFP4 / MXFP4</td><td class="num">4</td><td>가중치·활성값</td><td>보정 레시피 의존</td><td>Blackwell(B200)</td></tr>
+    <tr><td>GGUF (Q4_K_M 등)</td><td class="num">2~8</td><td>가중치</td><td>단계별 상이</td><td>llama.cpp·Ollama용. vLLM 대량 서빙엔 비권장</td></tr>
+    <tr><td>FP8 KV cache</td><td class="num">8</td><td>KV cache만</td><td>대부분 영향 작음</td><td><code>--kv-cache-dtype fp8</code></td></tr>
+    </table></div>
+    <h3>고르는 순서</h3>
+    <ol>
+    <li><strong>BF16으로 들어가고 KV가 넉넉하면</strong> 양자화하지 않습니다. 품질 검증 비용이 0입니다.</li>
+    <li><strong>Hopper·Ada면 FP8부터</strong>. 메모리 절반, 연산도 빨라지고 품질 손실이 거의 없습니다.</li>
+    <li><strong>Ampere면 INT8 W8A8 또는 AWQ INT4</strong>. A100은 FP8 텐서코어가 없어 FP8 체크포인트를 올려도 메모리만 줄고 연산 이득은 없습니다.</li>
+    <li><strong>그래도 안 들어가면 INT4</strong>. 반드시 실제 업무 질문 세트로 BF16 대비 비교 평가를 합니다.</li>
+    <li><strong>동시 요청이 문제면 FP8 KV cache</strong>. 같은 메모리로 KV 토큰 수가 두 배가 됩니다.</li>
+    </ol>
+    <div class="callout warn-box"><span class="label">자주 하는 실수</span><p>양자화는 "더 작은 모델"이 아니라 "같은 모델의 근사"입니다. 70B INT4가 32B BF16보다 대체로 낫지만, 긴 문맥 추론이나 숫자 계산은 업무 데이터로 직접 확인해야 합니다.</p></div>
+
+    <h2>VRAM 계산기</h2>
+    <p>조건을 바꾸며 어디서 OOM이 나는지, 동시 몇 명까지 받을 수 있는지 확인해 보세요. 예시 값은 70B를 A100 80GB 한 장에 BF16으로 올리는 경우이고, 아래 순서로 바꿔 보면 위 메모리와 양자화 내용이 숫자로 확인됩니다.</p>
+    <ol>
+    <li>기본값(70B, BF16, A100 1장) 그대로 두고 <strong>"로딩 OOM"</strong>이 뜨는지 확인</li>
+    <li>가중치 정밀도를 <strong>INT4</strong>로 바꾸기 → 기동은 되지만 동시 요청이 몇 개까지 되는지 보기</li>
+    <li>GPU를 <strong>H100</strong>, GPU 수를 <strong>2</strong>, 정밀도를 <strong>FP8</strong>로 바꾸기 → 여유가 얼마나 생기는지 보기</li>
+    <li><strong>동시 요청 수</strong>를 늘려 가며 "대기열 발생"이 뜨는 지점 찾기</li>
+    </ol>
+    <div class="figure" id="calc">
+      <div class="ctrls">
+        <label for="m">모델<select id="m">
+          <option value="8">8B (Llama 3.1 8B 구조)</option>
+          <option value="14">14B (Qwen2.5 14B 구조)</option>
+          <option value="32">32B (Qwen2.5 32B 구조)</option>
+          <option value="70" selected>70B (Llama 3.1 70B 구조)</option>
+          <option value="405">405B (Llama 3.1 405B 구조)</option>
+        </select></label>
+        <label for="q">가중치 정밀도<select id="q">
+          <option value="2" selected>BF16 / FP16</option>
+          <option value="1">FP8 / INT8</option>
+          <option value="0.55">INT4 (AWQ/GPTQ)</option>
+        </select></label>
+        <label for="kvq">KV cache 정밀도<select id="kvq">
+          <option value="2" selected>BF16</option>
+          <option value="1">FP8</option>
+        </select></label>
+        <label for="g">GPU<select id="g">
+          <option value="24|1008">RTX 4090 24GB</option>
+          <option value="48|768">RTX A6000 48GB</option>
+          <option value="48|864">L40S 48GB</option>
+          <option value="80|2039" selected>A100 80GB</option>
+          <option value="80|3350">H100 80GB SXM</option>
+          <option value="141|4800">H200 141GB</option>
+          <option value="180|8000">B200 180GB</option>
+        </select></label>
+        <label for="tp">GPU 수 (tensor parallel)<select id="tp">
+          <option value="1" selected>1</option><option value="2">2</option><option value="4">4</option><option value="8">8</option>
+        </select></label>
+        <label for="util">gpu-memory-utilization<input id="util" type="number" min="0.5" max="0.98" step="0.01" value="0.90"></label>
+        <label for="ctx">요청당 토큰 (입력+출력)<input id="ctx" type="number" min="512" max="131072" step="512" value="8192"></label>
+        <label for="cc">동시 요청 수<input id="cc" type="number" min="1" max="1024" step="1" value="16"></label>
+      </div>
+
+      <div class="verdict" id="verdict"><strong class="pill">판정</strong> <span></span></div>
+
+      <div class="cap"><span>GPU 전체 합산 메모리</span><span id="capTxt"></span></div>
+      <div class="bar" id="bar"><i class="w"></i><i class="o"></i><i class="kv"></i><i class="over"></i></div>
+      <div class="bar-legend"><span><i style="background:var(--blue)"></i>가중치</span><span><i style="background:var(--gray-bar)"></i>오버헤드</span><span><i style="background:var(--blue-light)"></i>요구 KV cache</span><span><i style="background:var(--warn)"></i>초과분</span><span><i style="background:var(--surface-2)"></i>남는 공간</span></div>
+
+      <div class="stats">
+        <div class="stat"><small>가중치 (GPU 1장당)</small><b id="sW">–</b><em>GB</em></div>
+        <div class="stat"><small>KV 예산 (합산)</small><b id="sKV">–</b><em>GB</em></div>
+        <div class="stat"><small>담을 수 있는 KV 토큰</small><b id="sTok">–</b><em>tokens</em></div>
+        <div class="stat"><small>이 길이로 최대 동시 요청</small><b id="sMax">–</b><em>개</em></div>
+        <div class="stat"><small>단일 요청 decode 상한</small><b id="sTps">–</b><em>tok/s</em></div>
+      </div>
+      <p class="fine">근사 계산입니다. 오버헤드는 GPU당 3GB로 가정했고, decode 속도는 "토큰 1개마다 가중치를 한 번 읽는다"는 대역폭 상한에 효율 60%를 곱한 값입니다. 실제 숫자는 vLLM 기동 로그의 <code>GPU KV cache size</code>로 확인하세요.</p>
+    </div>
+
+    <h2>사례로 다시 보기</h2>
+    <h3>70B를 A100 80GB 한 장에 올렸더니 OOM</h3>
+    <p>계산: 가중치 BF16 140GB, 사용 가능 메모리 80 × 0.9 = 72GB. 가중치 로딩 도중 <code>CUDA out of memory</code>가 납니다. 설정 문제가 아니라 산수 문제입니다.</p>
+    <p>H100 80GB에 FP8로 바꿔도 가중치 70GB + 오버헤드 약 3GB로 72GB를 넘거나 거의 꽉 차서 <code>No available memory for the cache blocks</code>가 납니다. 가중치가 "들어간다"와 "서비스가 된다"는 다릅니다.</p>
+    <p><strong>선택지</strong></p>
+    <ul>
+    <li>A100 1장 유지: AWQ INT4(약 38.5GB)로 KV 약 30GB 확보 → 8K 기준 동시 11개, FP8 KV 미지원 환경이면 여기서 끝</li>
+    <li>A100 2장 TP=2: INT8 W8A8(장당 35GB)로 KV 합산 약 68GB → 8K 기준 동시 25개 안팎</li>
+    <li>H100 2장 TP=2: FP8 가중치 + FP8 KV → 8K 기준 동시 50개 이상, 품질 손실 최소</li>
+    </ul>
+    <p><strong>정리하면</strong>, 메모리 계산, 양자화, GPU 세대(<a href="../llm-serving-runtime/">2편</a>), 동시 요청 수(<a href="../llm-serving-operations/">3편</a>)가 모두 하나의 계산으로 이어집니다. "백과사전이 책상에 올라가는가 → 메모장 자리가 몇 명분 남는가"를 차례로 따지면 어떤 GPU에 어떤 형식으로 올릴지가 정해집니다.</p>
+
+    <h3>어떤 Quantization을 써야 하나</h3>
+    <ul>
+    <li><strong>H100·L40S가 있다</strong>: FP8. 고민할 이유가 거의 없음</li>
+    <li><strong>A100·A6000만 있다</strong>: 메모리가 빠듯하면 AWQ INT4(Marlin 커널), 여유가 있으면 INT8 W8A8</li>
+    <li><strong>RTX 4090 같은 24GB 카드</strong>: 70B는 INT4로도 한 장에 안 들어감. 2장 TP라도 KV가 거의 남지 않아 실서비스 불가. 32B INT4나 8B급이 현실적인 범위</li>
+    <li><strong>공통</strong>: 업무 질문 100~200개를 BF16 결과와 나란히 비교한 뒤 결정. 공개 벤치마크 점수 차이가 작아도 특정 도메인에서 무너질 수 있음</li>
+    </ul>
+
+    <h2 id="glossary">용어 사전 (약자 풀이)</h2>
+    <p>1편에 나오는 약자를 모았습니다. GPU·드라이버 용어는 <a href="../llm-serving-runtime/#glossary">2편</a>, 성능 지표 용어는 <a href="../llm-serving-operations/#glossary">3편</a> 용어 사전에 있습니다.</p>
+    <h3>기본</h3>
+    <div class="table-wrap"><table>
+    <tr><th>약자</th><th>풀네임</th><th>쉬운 뜻</th></tr>
+    <tr><td>LLM</td><td>Large Language Model</td><td>대규모 언어 모델. ChatGPT, Llama 같은 모델</td></tr>
+    <tr><td>Transformer</td><td>Transformer</td><td>거의 모든 LLM이 쓰는 설계 구조. 레이어를 수십 개 쌓고 각 층에서 Attention으로 앞 토큰을 참고함. 자세한 설명은 위 KV cache 부분</td></tr>
+    <tr><td>GPU</td><td>Graphics Processing Unit</td><td>작은 계산 일꾼 수천 개가 동시에 일하는 칩</td></tr>
+    <tr><td>CUDA</td><td>Compute Unified Device Architecture</td><td>NVIDIA GPU에게 계산을 시키는 플랫폼</td></tr>
+    <tr><td>VRAM</td><td>Video RAM</td><td>GPU에 달린 메모리. "책상 크기"</td></tr>
+    <tr><td>HBM</td><td>High Bandwidth Memory</td><td>데이터센터 GPU에 쓰는 아주 빠른 메모리. decode 속도를 좌우</td></tr>
+    <tr><td>OOM</td><td>Out Of Memory</td><td>메모리 부족 에러</td></tr>
+    <tr><td>B (70B 등)</td><td>Billion</td><td>10억. 70B = 파라미터 700억 개</td></tr>
+    <tr><td>B (2B, 1B 등)</td><td>Byte</td><td>바이트. 가중치 표의 "BF16 (2B)"처럼 정밀도 옆 괄호 안에 있으면 <strong>파라미터 하나의 크기</strong>를 뜻함. 1바이트 = 8비트. 모델 크기의 B(Billion)와 글자가 같아 헷갈리기 쉬움</td></tr>
+    <tr><td>토큰</td><td>token</td><td>모델이 글을 자르는 단위. 한국어는 대략 글자 1~2개</td></tr>
+    </table></div>
+    <h3>메모리와 양자화</h3>
+    <div class="table-wrap"><table>
+    <tr><th>약자</th><th>풀네임</th><th>쉬운 뜻</th></tr>
+    <tr><td>KV cache</td><td>Key-Value cache</td><td>이미 처리한 토큰을 적어 두는 "대화 메모장"</td></tr>
+    <tr><td>BF16</td><td>Brain Floating Point 16-bit</td><td>숫자 하나에 2바이트. 원본 기준 형식 (Google Brain에서 만듦)</td></tr>
+    <tr><td>FP16 / FP8 / FP4</td><td>Floating Point 16/8/4-bit</td><td>소수점 숫자를 16/8/4비트로 저장</td></tr>
+    <tr><td>INT8 / INT4</td><td>Integer 8/4-bit</td><td>정수 형태로 8/4비트에 저장</td></tr>
+    <tr><td>2B / 1B / ≈0.55B</td><td>파라미터당 바이트</td><td>BF16은 16비트 = 2바이트, FP8·INT8은 8비트 = 1바이트, INT4는 4비트 = 0.5바이트에 스케일을 더해 약 0.55바이트. 비트 수 ÷ 8 = 바이트 수. 70B 모델이면 각각 140GB, 70GB, 약 38.5GB</td></tr>
+    <tr><td>스케일</td><td>scale</td><td>4비트 정수는 값을 16개(-8~7)만 표현할 수 있어서, 가중치를 128개 정도씩 묶고 묶음마다 "정수 1칸 = 실제 값 얼마"라는 배율을 따로 저장함. 쓸 때 <code>정수 × 스케일</code>로 원래 값에 가깝게 되돌림. 지도의 축척(1cm = 1km)과 같은 역할. 이 배율도 메모리를 차지해서 INT4가 0.5가 아니라 약 0.55바이트가 됨</td></tr>
+    <tr><td>W8A8 / W4A16</td><td>Weight 8-bit, Activation 8-bit 등</td><td>가중치(W)와 중간 계산값(A)을 각각 몇 비트로 쓰는지</td></tr>
+    <tr><td>AWQ</td><td>Activation-aware Weight Quantization</td><td>중요한 가중치를 보호하며 4비트로 줄이는 방법</td></tr>
+    <tr><td>GPTQ</td><td>GPT Quantization</td><td>학습이 끝난 모델을 오차를 보정하며 4비트로 줄이는 방법</td></tr>
+    <tr><td>GGUF</td><td>(llama.cpp 파일 형식)</td><td>Ollama·llama.cpp용 모델 파일. 개인 PC용</td></tr>
+    <tr><td>NVFP4 / MXFP4</td><td>NVIDIA FP4 / Microscaling FP4</td><td>Blackwell GPU용 4비트 형식</td></tr>
+    </table></div>
+
+    <p class="caption">메모리·속도 수치는 공개된 모델 구조와 GPU 사양으로 계산한 근사치입니다. 실제 값은 vLLM 버전, 커널, 입출력 길이에 따라 달라지므로 기동 로그와 벤치마크로 확인하세요.</p>
+
+    <nav class="series-pager" aria-label="이전·다음 편">
+      <a class="next" href="../llm-serving-runtime/"><span>다음 2편 →</span>GPU 위에서 모델이 돌아가는 방식</a>
+    </nav>
+  </main>
+  <footer class="site-footer">naelog · dev</footer>
+
+  <script>
+    (function () {
+      // 레이어, KV 헤드, 헤드 차원
+      var M = {8: [32, 8, 128], 14: [48, 8, 128], 32: [64, 8, 128], 70: [80, 8, 128], 405: [126, 8, 128]};
+      var OVH = 3; // GPU당 오버헤드 GB
+      var $ = function (id) { return document.getElementById(id); };
+      function fmt(n, d) { return n.toLocaleString('ko-KR', {maximumFractionDigits: d == null ? 1 : d, minimumFractionDigits: 0}); }
+      function run() {
+        var p = +$('m').value, bpp = +$('q').value, kvb = +$('kvq').value;
+        var g = $('g').value.split('|'), mem = +g[0], bw = +g[1];
+        var tp = +$('tp').value, util = Math.min(Math.max(+$('util').value || 0.9, 0.5), 0.98);
+        var ctx = Math.max(+$('ctx').value || 1, 1), cc = Math.max(+$('cc').value || 1, 1);
+        var a = M[p], perTok = 2 * a[0] * a[1] * a[2] * kvb; // bytes
+        var wTot = p * bpp, wPer = wTot / tp;
+        var usable = mem * util, capTot = mem * tp;
+        var kvBudgetPer = usable - wPer - OVH, kvBudget = Math.max(kvBudgetPer, 0) * tp;
+        var kvNeed = perTok * ctx * cc / 1e9;
+        var tokens = kvBudget * 1e9 / perTok, maxCc = Math.floor(tokens / ctx);
+        var tps = (bw * tp * 0.6) / wTot;
+
+        var v = $('verdict'), cls, pill, msg;
+        if (wPer > usable) { cls = 'bad'; pill = '로딩 OOM'; msg = 'GPU 1장에 가중치 ' + fmt(wPer) + 'GB를 올려야 하는데 사용 가능 메모리는 ' + fmt(usable) + 'GB입니다. 가중치를 읽는 중에 CUDA out of memory가 납니다.'; }
+        else if (kvBudgetPer <= 0.5) { cls = 'bad'; pill = 'KV 자리 없음'; msg = '가중치는 들어가지만 오버헤드를 빼면 KV cache 자리가 거의 없습니다. vLLM이 "No available memory for the cache blocks"로 기동에 실패합니다.'; }
+        else if (maxCc < 1) { cls = 'bad'; pill = '길이 초과'; msg = '요청 하나(' + fmt(ctx, 0) + ' 토큰)도 담을 KV가 없습니다. --max-model-len을 ' + fmt(Math.floor(tokens), 0) + ' 이하로 줄여야 기동됩니다.'; }
+        else if (maxCc < cc) { cls = 'warn'; pill = '대기열 발생'; msg = '기동은 되지만 이 길이로는 동시 ' + maxCc + '개까지만 KV에 담깁니다. 나머지 ' + (cc - maxCc) + '개는 대기하거나 선점되어 TTFT가 크게 늘어납니다.'; }
+        else { cls = 'ok'; pill = '여유 있음'; msg = '동시 ' + cc + '개를 모두 KV에 담을 수 있습니다. 이 길이 기준으로 최대 ' + maxCc + '개까지 대기열 없이 처리할 수 있습니다.'; }
+        v.className = 'verdict ' + cls; v.children[0].textContent = pill; v.children[1].textContent = msg;
+
+        var total = Math.max(capTot, wTot + OVH * tp + kvNeed);
+        var bars = $('bar').children;
+        var wShow = Math.min(wTot, capTot), oShow = Math.min(OVH * tp, Math.max(capTot - wShow, 0));
+        var kvRoom = Math.max(capTot * util - wShow - oShow, 0);
+        var kvShow = Math.min(kvNeed, kvRoom);
+        var over = Math.max(wTot + OVH * tp + kvNeed - capTot * util, 0);
+        bars[0].style.width = (wShow / total * 100) + '%';
+        bars[1].style.width = (oShow / total * 100) + '%';
+        bars[2].style.width = (kvShow / total * 100) + '%';
+        bars[3].style.width = (over / total * 100) + '%';
+        $('capTxt').textContent = mem + 'GB × ' + tp + ' = ' + capTot + 'GB, 사용 한도 ' + fmt(capTot * util) + 'GB';
+
+        $('sW').textContent = fmt(wPer);
+        $('sKV').textContent = fmt(kvBudget);
+        $('sTok').textContent = fmt(Math.floor(tokens), 0);
+        $('sMax').textContent = fmt(Math.max(maxCc, 0), 0);
+        $('sTps').textContent = wPer > usable ? '–' : fmt(tps, 0);
+      }
+      ['m', 'q', 'kvq', 'g', 'tp', 'util', 'ctx', 'cc'].forEach(function (id) { $(id).addEventListener('input', run); $(id).addEventListener('change', run); });
+      run();
+    })();
+  </script>
+  <script src="../../assets/edit.js"></script>
+</body>
+</html>

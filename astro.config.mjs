@@ -97,7 +97,7 @@ function postEditor() {
 //  - 저장소 이름이 <아이디>.github.io 이거나 커스텀 도메인이면 base: '/'
 export default defineConfig({
   site: 'https://naenae0210.github.io',
-  base: '/naedevlog',
+  base: '/naelog',
   trailingSlash: 'always',
   integrations: [postEditor()],
 });

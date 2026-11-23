@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Why Do Answers Come Out One Token at a Time? CUDA, Decode, vLLM · naelog</title>
+  <meta name="description" content="Part 2 of the LLM serving notes: CUDA and driver layers, prefill and decode, and vLLM PagedAttention and continuous batching." />
+  <!-- 홈 목록에 쓰이는 정보 -->
+  <meta name="post:log" content="dev" />
+  <meta name="post:date" content="2026-11-23" />
+  <meta name="post:series" content="LLM Serving" />
+  <meta name="post:part" content="2" />
+  <meta name="post:category" content="GPU &amp; Inference" />
+  <meta name="post:tags" content="LLM Serving, CUDA, vLLM" />
+  <link rel="stylesheet" href="../../../assets/naedevlog.css" />
+  <link rel="alternate" hreflang="ko" href="../../../posts/llm-serving-runtime/" />
+  <script src="../../../assets/site.js"></script>
+  <style>
+    /* 설명이 긴 표는 칸 안에서 줄바꿈한다 */
+    .table-wrap td:not(.num) { white-space: normal; min-width: 7em; }
+    .table-wrap th { white-space: nowrap; }
+  </style>
+</head>
+<body>
+  <header class="site-header"><div class="inner">
+    <a class="logo" href="../../">naelog</a>
+    <nav class="nav">
+      <a href="../../dev/" aria-current="page">dev</a>
+      <a href="../../book/">book</a>
+      <a href="../../scrap/">scrap</a>
+    </nav>
+  </div></header>
+
+  <main class="wrap">
+    <div class="category">LLM Serving · Part 2</div>
+    <h1>Why Do Answers Come Out One Token at a Time? CUDA, Decode, vLLM</h1>
+    <p class="lead">Once the model fits in memory, it is time to follow one request through the GPU until it becomes an answer.</p>
+    <div class="post-meta">
+      <span>2026.11.23</span><span class="dot"></span><span>15 min</span>
+      <span class="tag">LLM Serving</span><span class="tag">CUDA</span><span class="tag">vLLM</span>
+    </div>
+
+    <nav class="series" aria-label="LLM serving series">
+      <div class="series-label">LLM serving notes · 3 parts</div>
+      <a href="../llm-serving-memory/"><span>Part 1</span>Memory and quantization<small>Why doesn't 70B fit on one A100?</small></a>
+      <a href="../llm-serving-runtime/" aria-current="page"><span>Part 2 · reading now</span>How a model runs on the GPU<small>Why do answers come out one token at a time?</small></a>
+      <a href="../llm-serving-operations/"><span>Part 3</span>Performance and operations<small>What breaks first at 100 users?</small></a>
+    </nav>
+
+    <p><strong>Part 1 recap:</strong> GPU memory is a <strong>desk</strong>, and on it go the <strong>encyclopedia (weights)</strong>, the <strong>conversation notepads (KV cache)</strong> and the <strong>pens (overhead)</strong>. If the encyclopedia is too thick, <strong>quantization</strong> makes it thinner.</p>
+    <p>This part asks <strong>"how does the model on the desk actually run?"</strong></p>
+    <ol>
+    <li><strong>CUDA and drivers</strong>: the layers a program goes through to give the GPU work, and why version errors happen</li>
+    <li><strong>Loading and inference</strong>: prefill, which reads the question all at once, and decode, which writes one token at a time</li>
+    <li><strong>vLLM</strong>: the serving engine that shares this machinery efficiently across many users</li>
+    </ol>
+    <p>By the end you can explain "why answers come out one token at a time, and why memory speed sets that speed".</p>
+    <h2>CUDA and GPU drivers</h2>
+    <p>Running a model on a GPU takes several layers of software between the program and the GPU. Knowing what those layers are and how they connect clears up most installation errors.</p>
+
+    <h3>What CUDA is</h3>
+    <p><strong>CUDA</strong> (Compute Unified Device Architecture) is NVIDIA's <strong>"way of giving work to the GPU"</strong>. GPUs started as devices for drawing game graphics, but inside they hold thousands of small workers doing simple calculations at once, which suits work that repeats the same calculation enormously, like matrix multiplication, exactly what AI models do. CUDA is the way to give those workers jobs other than drawing. It only runs on NVIDIA GPUs; AMD uses a separate stack called ROCm.</p>
+    <p>CUDA is not one program; it is a bundle of parts.</p>
+    <div class="table-wrap"><table>
+    <tr><th>Part</th><th>Example</th><th>What it does</th></tr>
+    <tr><td><strong>Language</strong></td><td>CUDA C++</td><td>Syntax for writing functions (kernels) that run on the GPU</td></tr>
+    <tr><td><strong>Compiler</strong></td><td><code>nvcc</code></td><td>Turns that code into machine code the GPU reads</td></tr>
+    <tr><td><strong>Runtime API</strong></td><td><code>cudaMalloc</code>, <code>cudaMemcpy</code>, kernel launch</td><td>Grab GPU memory, copy data, launch work</td></tr>
+    <tr><td><strong>Libraries</strong></td><td>cuBLAS, cuDNN, NCCL</td><td>Common calculations NVIDIA has already optimized</td></tr>
+    <tr><td><strong>Dev tools</strong></td><td>Nsight</td><td>Profilers that measure what is slow</td></tr>
+    </table></div>
+    <p>Among the libraries, <strong>cuBLAS</strong> handles matrix multiplication, where most LLM compute runs. <strong>cuDNN</strong> is a collection of deep learning operations, and <strong>NCCL</strong> ("nickel") is the library GPUs use to exchange data, called at every layer when you run tensor parallel across two GPUs.</p>
+
+    <h3>PyTorch and vLLM write CUDA for you</h3>
+    <p>Adding two arrays directly in CUDA looks like this.</p>
+    <pre><code>// The function that runs on the GPU (kernel). Each worker takes one number
+    __global__ void add(float* a, float* b, float* c, int n) {
+        int i = blockIdx.x * blockDim.x + threadIdx.x;  // which worker am I
+        if (i &lt; n) c[i] = a[i] + b[i];
+    }
+
+    int main() {
+        cudaMalloc(&amp;a, n * 4);  cudaMalloc(&amp;b, n * 4);  cudaMalloc(&amp;c, n * 4);  // grab GPU memory
+        cudaMemcpy(a, host_a, n * 4, cudaMemcpyHostToDevice);  // copy CPU → GPU
+        cudaMemcpy(b, host_b, n * 4, cudaMemcpyHostToDevice);
+
+        add&lt;&lt;&lt;n / 256, 256&gt;&gt;&gt;(a, b, c, n);   // launch many teams of 256 workers
+
+        cudaMemcpy(host_c, c, n * 4, cudaMemcpyDeviceToHost);  // results GPU → CPU
+        cudaFree(a); cudaFree(b); cudaFree(c);   // give the memory back
+    }</code></pre>
+    <p>Even one addition means handling allocation, copying, splitting work across workers, fetching results and freeing memory yourself. In PyTorch the same thing is one line.</p>
+    <pre><code>import torch
+    a = torch.randn(n, device="cuda")   # make an array on the GPU
+    b = torch.randn(n, device="cuda")
+    c = a + b                           # done</code></pre>
+    <p>Behind <code>a + b</code>, PyTorch does the equivalent of the CUDA code above for you: it allocates memory, picks a prebuilt addition kernel, decides how many workers and launches it. For a matrix multiplication <code>a @ b</code> it calls cuBLAS internally. vLLM sits one level higher: without writing any PyTorch, one line, <code>vllm serve model-name</code>, builds the model in PyTorch and runs it whenever requests arrive.</p>
+    <div class="callout info">
+    <span class="label">In plain words · As a restaurant</span>
+    <div class="table-wrap"><table>
+    <tr><th>Layer</th><th>Restaurant analogy</th><th>What you do yourself</th></tr>
+    <tr><td>CUDA directly</td><td>Burner heat, pan temperature, chopping, all by hand</td><td>Everything</td></tr>
+    <tr><td>PyTorch</td><td>Telling the kitchen "steak, medium"</td><td>The cooking order (model structure)</td></tr>
+    <tr><td>vLLM</td><td>A manager who handles guests, order queue and seating</td><td>Just pick the menu</td></tr>
+    </table></div>
+    <p>The lower you go, the finer the control but the more work; the higher you go, the easier it is but the more detail you hand over.</p>
+    </div>
+
+    <h3>How one request travels down to the GPU</h3>
+    <p>When a user sends "Hi?", the instructions go down through five layers and the result comes back up.</p>
+    <pre><code>User → ① vLLM → ② PyTorch → ③ CUDA runtime and libraries → ④ GPU driver → ⑤ GPU</code></pre>
+    <div class="table-wrap"><table>
+    <tr><th>Step</th><th>Purpose</th><th>What it does</th></tr>
+    <tr><td><strong>① vLLM</strong></td><td>Serve many guests efficiently</td><td>Receives the HTTP request → turns "Hi?" into token IDs (e.g. <code>[52, 1031, 30]</code>) → the scheduler batches it with other requests → assigns KV cache blocks → asks PyTorch to "run the model once on this batch". Queue, KV usage, preemption and other operational metrics all come from here</td></tr>
+    <tr><td><strong>② PyTorch</strong></td><td>Translate the model math into a list of GPU jobs</td><td>Follows model code defined as "80 layers, attention and feed-forward in each" and turns matrix multiplies, softmax, normalization and so on into GPU jobs one by one. Tracks which GPU memory each tensor lives in</td></tr>
+    <tr><td><strong>③ CUDA runtime and libraries</strong></td><td>Run this calculation as fast as possible on this GPU</td><td>For a "4096×8192 matrix multiply", cuBLAS picks the fastest method for this GPU generation and size (A100 and H100 choose differently). Queues kernel launches in order on a stream. Allocates and frees GPU memory</td></tr>
+    <tr><td><strong>④ GPU driver</strong></td><td>Interpreter between the OS and the hardware</td><td>Turns CUDA commands into signals the hardware understands and puts them in the GPU command queue. Does the last compile of kernels to this GPU's machine code if needed. When several programs share one GPU, it orders them and keeps their memory apart. Like needing a printer driver to use a printer</td></tr>
+    <tr><td><strong>⑤ GPU</strong></td><td>The actual compute</td><td>Thousands of cores inside the SMs run the kernels in parallel. Reads weights and KV from HBM and writes results. After all 80 layers you get "a score for each candidate next token"</td></tr>
+    <tr><td><strong>⑥ Back up</strong></td><td>One token to the user</td><td>Picks one next token from the scores (sampling), and vLLM turns it into text and streams it out. Then <strong>repeats ② to ⑤ for every token</strong>. This is the decode covered below</td></tr>
+    </table></div>
+    <p>In practice there is also a path straight from ① to ③. Where speed matters, vLLM skips PyTorch's built-in ops and calls <strong>its own CUDA kernels</strong> directly, such as PagedAttention, FlashAttention and Marlin for 4-bit models.</p>
+    <p>This flow also gives a sense of scale. A 70B model passes through 80 layers to make one token, with several kernels per layer, so <strong>hundreds to thousands of GPU jobs go down for a single token</strong>. Just the CPU issuing those commands one by one can slow things down, so vLLM records the command sequence once and replays it whole. That is the <strong>CUDA graph</strong> in the overhead list of <a href="../llm-serving-memory/">part 1</a> and in the last loading step below.</p>
+
+    <h3>Versions stack three layers deep</h3>
+    <p>"CUDA version" shows up in three places, the driver, the runtime and the Toolkit, which is what makes it confusing. You only need to know what is installed where.</p>
+    <div class="table-wrap"><table>
+    <tr><th>Layer</th><th>Where</th><th>How to check</th><th>Role</th></tr>
+    <tr><td>GPU driver</td><td>Host OS (kernel module)</td><td>Driver Version at the top of <code>nvidia-smi</code></td><td>Actually drives the GPU. Sets the maximum supported CUDA version</td></tr>
+    <tr><td>CUDA runtime</td><td>Inside the PyTorch wheel or container image</td><td><code>torch.version.cuda</code></td><td>The CUDA the app uses. Must be at or below what the driver supports</td></tr>
+    <tr><td>CUDA Toolkit (nvcc)</td><td>Dev environment</td><td><code>nvcc --version</code></td><td>Only needed to build custom kernels yourself</td></tr>
+    <tr><td>nvidia-container-toolkit</td><td>Host</td><td><code>docker run --gpus all ... nvidia-smi</code></td><td>Plugs the GPU and driver libraries into containers</td></tr>
+    </table></div>
+    <p>The "CUDA Version 12.8" in <code>nvidia-smi</code> is not the installed CUDA; it is <strong>the maximum version this driver supports</strong>. That is why a CUDA 12.4 container image runs fine on it. There is one rule to remember: <strong>the CUDA runtime version the program uses ≤ the maximum version the driver supports</strong>.</p>
+
+    <h3>Compute capability: features are set by the GPU generation</h3>
+    <div class="table-wrap"><table>
+    <tr><th>Generation</th><th>Examples</th><th>CC</th><th>Meaning</th></tr>
+    <tr><td>Ampere</td><td>A100 / A6000, 3090</td><td class="num">8.0 / 8.6</td><td>BF16, FlashAttention 2. No FP8 compute</td></tr>
+    <tr><td>Ada</td><td>L40S, 4090</td><td class="num">8.9</td><td>FP8 compute</td></tr>
+    <tr><td>Hopper</td><td>H100, H200</td><td class="num">9.0</td><td>FP8, FlashAttention 3</td></tr>
+    <tr><td>Blackwell</td><td>B200</td><td class="num">10.0</td><td>FP4, needs a recent driver and CUDA 12.8 or later</td></tr>
+    </table></div>
+
+    <h3>Common errors and causes</h3>
+    <p>Most errors happen when two layers of the flow above do not match. The error message tells you which pair of layers to look at.</p>
+    <div class="table-wrap"><table>
+    <tr><th>Error</th><th>Where it broke</th><th>Cause and fix</th></tr>
+    <tr><td><code>CUDA driver version is insufficient for CUDA runtime version</code></td><td>③ runtime ↔ ④ driver</td><td>The image's CUDA is newer than the host driver, so they cannot talk. Upgrade the driver or use an image with an older CUDA</td></tr>
+    <tr><td><code>no kernel image is available for execution on the device</code></td><td>③ kernel ↔ ⑤ GPU</td><td>The installed binary was not built for this GPU generation (CC). An old wheel on a new GPU, or the reverse</td></tr>
+    <tr><td><code>Failed to initialize NVML: Driver/library version mismatch</code></td><td>Inside ④ the driver</td><td>The driver was updated without a reboot, so old and new are mixed</td></tr>
+    <tr><td>No GPU visible inside the container</td><td>④ driver ↔ container</td><td><code>--gpus all</code> missing, or nvidia-container-toolkit not installed. On k8s, check with <code>kubectl describe node</code> that the device plugin advertises the GPU</td></tr>
+    <tr><td><code>CUDA out of memory</code></td><td>⑤ GPU memory</td><td>The desk is full. Start again from the memory math in part 1</td></tr>
+    </table></div>
+
+    <h2>Model loading and inference</h2>
+    <p>One request goes through two stages with completely different characters: "read it all at once" (prefill) and "write one token at a time" (decode).</p>
+    <h3>Loading</h3>
+    <ol>
+    <li>Weights are read from disk (safetensors) and copied to the GPU. 70B BF16 means reading 140GB, so NVMe or network storage speed decides startup time</li>
+    <li>With tensor parallel, each layer's matrices are split across the GPUs. The GPUs exchange results over NVLink/PCIe at every layer</li>
+    <li>The engine measures peak activation memory with a dummy request (profiling)</li>
+    <li>All remaining memory is reserved up front as KV cache blocks. That is why <code>nvidia-smi</code> shows 90% right after vLLM starts, and that is normal</li>
+    <li>CUDA graphs are captured, then it starts accepting requests</li>
+    </ol>
+    <h3>Prefill and decode</h3>
+    <p>Prefill reads the whole question sheet in one go; decode writes the answer one character at a time.</p>
+    <div class="table-wrap"><table>
+    <tr><th></th><th>Prefill</th><th>Decode</th></tr>
+    <tr><td>What it does</td><td>Processes the whole input prompt at once and builds the KV</td><td>Generates tokens one by one, reading all weights and KV each time</td></tr>
+    <tr><td>Bottleneck</td><td>Compute (compute-bound)</td><td>Memory bandwidth (memory-bound)</td></tr>
+    <tr><td>Metric it sets</td><td>TTFT (time to first token)</td><td>TPOT (time between tokens)</td></tr>
+    <tr><td>What users feel</td><td>"It is slow to respond"</td><td>"The text comes out slowly"</td></tr>
+    <tr><td>Grows with</td><td>Long prompts, lots of RAG documents attached</td><td>Long answers, big models, big batches</td></tr>
+    </table></div>
+    <p>Decode is bound by memory bandwidth because every character means skimming the whole encyclopedia (weights) once. At batch size 1, making one token means reading all the weights from HBM once. Running 70B BF16 (140GB) on two H100s (6.7TB/s combined) gives a theoretical ceiling of about 48 tok/s. Make the encyclopedia half as thick with quantization and the ceiling nearly doubles.</p>
+    <p>And when several requests share one skim of the weights, the bandwidth cost is split among them. It is like putting many passengers on one bus, and it is how batching raises throughput.</p>
+
+    <h2>vLLM</h2>
+    <p>vLLM is several times faster than HuggingFace <code>generate()</code> because of techniques that use memory sparingly and scheduling that processes requests together.</p>
+    <ul>
+    <li><strong>PagedAttention</strong>: splits the KV cache into small blocks like OS pages (16 tokens by default) and allocates them only when needed. Older engines reserved a full maximum-length notepad per request, and since most conversations end short, a lot was wasted. Handing out only what is needed lets far more requests fit in the same memory</li>
+    <li><strong>Continuous batching</strong>: instead of waiting for a whole batch to finish, every decode step removes finished requests and adds new ones. Like a bus where, at each stop, some get off and others get on</li>
+    <li><strong>Prefix caching</strong>: requests that start with the same system prompt or the same RAG documents build that part of the KV once and share it</li>
+    <li><strong>Chunked prefill</strong>: splits a long prompt's prefill into chunks and slots them between decode steps, so one long request does not freeze other users' token generation</li>
+    </ul>
+    <h3>How the settings connect to the memory math</h3>
+    <pre><code># 70B on two H100s, FP8 weights + FP8 KV
+    vllm serve meta-llama/Llama-3.1-70B-Instruct \
+      --tensor-parallel-size 2 \          # split weights across 2 cards
+      --quantization fp8 \                # 140GB → 70GB
+      --kv-cache-dtype fp8 \              # 2x KV tokens
+      --max-model-len 16384 \             # max length of one request
+      --gpu-memory-utilization 0.90 \     # use up to 72GB per card
+      --max-num-seqs 64                   # cap on requests running at once</code></pre>
+    <p>Two lines to always check in the startup log:</p>
+    <pre><code>GPU KV cache size: 437,200 tokens
+    Maximum concurrency for 16,384 tokens per request: 26.68x</code></pre>
+    <p>The second line means "if every request fills 16K, up to 26 at once". Real requests are usually shorter so more fit, but you design around this number.</p>
+    <div class="callout warn-box"><span class="label">Typical OOM messages at startup</span><p><code>CUDA out of memory. Tried to allocate ...</code>: the weights themselves do not fit.<br>
+    <code>No available memory for the cache blocks</code>: the weights fit but there is zero room for KV.<br>
+    <code>max seq len (131072) is larger than the maximum number of tokens that can be stored in KV cache</code>: there is not enough KV for the model's default max length (128K). Lowering <code>--max-model-len</code> fixes it.</p></div>
+
+    <h2 id="glossary">Glossary</h2>
+    <p>Abbreviations used in part 2. Basic and quantization terms are in the <a href="../llm-serving-memory/#glossary">part 1</a> glossary, performance metrics in the <a href="../llm-serving-operations/#glossary">part 3</a> glossary.</p>
+    <h3>GPUs and drivers</h3>
+    <div class="table-wrap"><table>
+    <tr><th>Term</th><th>Full name</th><th>Plain meaning</th></tr>
+    <tr><td>CUDA</td><td>Compute Unified Device Architecture</td><td>NVIDIA's platform for giving work to the GPU</td></tr>
+    <tr><td>GPU</td><td>Graphics Processing Unit</td><td>A chip where thousands of small workers compute at once</td></tr>
+    <tr><td>HBM</td><td>High Bandwidth Memory</td><td>Very fast memory on data center GPUs. Sets decode speed</td></tr>
+    <tr><td>CC</td><td>Compute Capability</td><td>The GPU generation number. Decides which features are available</td></tr>
+    <tr><td>nvcc</td><td>NVIDIA CUDA Compiler</td><td>The compiler for building CUDA code yourself</td></tr>
+    <tr><td>Kernel</td><td>kernel</td><td>One function that runs on the GPU. Not the operating system "kernel"</td></tr>
+    <tr><td>cuBLAS</td><td>CUDA Basic Linear Algebra Subprograms</td><td>NVIDIA's matrix multiplication library</td></tr>
+    <tr><td>cuDNN</td><td>CUDA Deep Neural Network library</td><td>A library of deep learning operations</td></tr>
+    <tr><td>NCCL</td><td>NVIDIA Collective Communications Library</td><td>The library GPUs use to exchange data ("nickel")</td></tr>
+    <tr><td>NVML</td><td>NVIDIA Management Library</td><td>The library <code>nvidia-smi</code> uses to read GPU status</td></tr>
+    <tr><td>DCGM</td><td>Data Center GPU Manager</td><td>A monitoring tool that shows real GPU utilization in detail</td></tr>
+    <tr><td>SM</td><td>Streaming Multiprocessor</td><td>A compute block inside the GPU. A "team of workers"</td></tr>
+    <tr><td>TP</td><td>Tensor Parallel</td><td>Splitting one model across several GPUs</td></tr>
+    <tr><td>NVLink / PCIe</td><td>NVIDIA Link / PCI Express</td><td>Links between GPUs, and between the GPU and the computer. NVLink is much faster</td></tr>
+    </table></div>
+
+    <p class="caption">Memory and speed figures are approximations calculated from published model architectures and GPU specs. Real values vary with the vLLM version, kernels and input/output length, so confirm them with startup logs and benchmarks.</p>
+
+    <nav class="series-pager" aria-label="Previous and next part">
+      <a href="../llm-serving-memory/"><span>← Part 1</span>Memory and quantization</a>
+      <a class="next" href="../llm-serving-operations/"><span>Part 3 →</span>Performance and operations</a>
+    </nav>
+  </main>
+  <footer class="site-footer">naelog · dev</footer>
+  <script src="../../../assets/edit.js"></script>
+</body>
+</html>

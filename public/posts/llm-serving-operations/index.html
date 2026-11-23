@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>사용자가 100명이 되면 무엇이 먼저 무너질까: 지표와 동시 요청 · naelog</title>
+  <meta name="description" content="GPU 사용률의 함정, TTFT·TPOT·처리량, 동시 요청이 늘 때 무너지는 순서와 용량 계산을 정리한 LLM 서빙 3편입니다." />
+  <!-- 홈 목록에 쓰이는 정보 -->
+  <meta name="post:log" content="dev" />
+  <meta name="post:date" content="2026-11-23" />
+  <meta name="post:series" content="LLM 서빙" />
+  <meta name="post:part" content="3" />
+  <meta name="post:category" content="GPU와 추론" />
+  <meta name="post:tags" content="LLM 서빙, vLLM, Latency, Throughput" />
+  <link rel="stylesheet" href="../../assets/naedevlog.css" />
+  <link rel="alternate" hreflang="en" href="../../en/posts/llm-serving-operations/" />
+  <script src="../../assets/site.js"></script>
+  <style>
+    /* 설명이 긴 표는 칸 안에서 줄바꿈한다 */
+    .table-wrap td:not(.num) { white-space: normal; min-width: 7em; }
+    .table-wrap th { white-space: nowrap; }
+  </style>
+</head>
+<body>
+  <header class="site-header"><div class="inner">
+    <a class="logo" href="../../">naelog</a>
+    <nav class="nav">
+      <a href="../../dev/" aria-current="page">dev</a>
+      <a href="../../book/">book</a>
+      <a href="../../scrap/">scrap</a>
+    </nav>
+  </div></header>
+
+  <main class="wrap">
+    <div class="category">LLM 서빙 · 3편</div>
+    <h1>사용자가 100명이 되면 무엇이 먼저 무너질까: 지표와 동시 요청</h1>
+    <p class="lead">한 명이 쓸 때 빠른 것과 백 명이 쓸 때 버티는 것은 다릅니다. 3편은 지표를 읽는 법과 동시 요청 용량을 설계하는 법을 다룹니다.</p>
+    <div class="post-meta">
+      <span>2026.11.23</span><span class="dot"></span><span>10분</span>
+      <span class="tag">LLM 서빙</span><span class="tag">vLLM</span><span class="tag">Latency</span><span class="tag">Throughput</span>
+    </div>
+
+    <nav class="series" aria-label="LLM 서빙 시리즈">
+      <div class="series-label">LLM 서빙 학습 노트 · 3편</div>
+      <a href="../llm-serving-memory/"><span>1편</span>메모리와 양자화<small>70B는 왜 A100 한 장에 안 들어갈까</small></a>
+      <a href="../llm-serving-runtime/"><span>2편</span>GPU 위에서 모델이 돌아가는 방식<small>답은 왜 한 글자씩 나올까</small></a>
+      <a href="../llm-serving-operations/" aria-current="page"><span>3편 · 지금 읽는 중</span>성능과 운영<small>사용자가 100명이 되면 무엇이 먼저 무너질까</small></a>
+    </nav>
+
+    <p><strong>1편:</strong> 모델이 들어가려면 가중치 + KV cache + 오버헤드가 GPU 메모리 안에 들어와야 합니다. KV cache 자리가 곧 동시에 받을 수 있는 사람 수입니다.</p>
+    <p><strong>2편:</strong> 답은 한 글자(토큰)씩 만들어지고(decode), 글자 하나마다 가중치 전체를 읽어야 해서 메모리 속도가 병목입니다. 그래서 여러 요청을 <strong>한 버스에 태우는 배칭</strong>이 효율을 올리고, vLLM이 그 버스를 운영합니다.</p>
+    <p>이번 편의 질문은 <strong>"실제로 사람들이 쓰기 시작하면 어디서 느려지고, 몇 명까지 버티는가?"</strong>입니다.</p>
+    <ol>
+    <li><strong>성능 지표</strong>: GPU 사용률의 함정, 응답 시간(TTFT·TPOT·E2E), 처리량</li>
+    <li><strong>동시 요청 처리</strong>: 사용자가 늘 때 무너지는 순서와 필요한 용량 계산</li>
+    <li><strong>사례</strong>: 사용자가 10명에서 100명으로 늘면</li>
+    </ol>
+    <h2>GPU Utilization, Inference Latency, Throughput</h2>
+    <h3>GPU Utilization은 생각보다 많은 걸 숨긴다</h3>
+    <p><code>nvidia-smi</code>의 GPU-Util 100%는 "샘플링 구간 동안 커널이 하나라도 돌고 있었다"는 뜻일 뿐, SM이 꽉 찼다는 뜻이 아닙니다. 공장 불이 켜져 있다고 일꾼 전원이 일하는 건 아닌 것과 같습니다. decode 위주 부하는 Util 100%이면서 실제 연산 유닛은 20~30%만 쓰는 경우가 흔합니다. 진짜 상태는 DCGM의 <code>SM Activity</code>, <code>DRAM Activity</code>(대역폭 사용률)로 봅니다. 메모리 사용률 90%도 vLLM이 미리 잡아 둔 것이라 부하 지표가 아닙니다. 실제 KV 사용률은 vLLM의 <code>vllm:gpu_cache_usage_perc</code>입니다.</p>
+
+    <h3>Latency는 세 개로 쪼개서 본다</h3>
+    <figure class="figure">
+      <svg viewBox="0 0 700 110" role="img" aria-label="요청 하나의 시간 구성: 대기열, prefill, decode 토큰들" font-family="Pretendard Variable, Pretendard, sans-serif">
+        <text x="0" y="31" fill="#4e5968" font-size="13" font-weight="600">요청</text>
+        <g transform="translate(60,14)">
+          <rect x="0" y="0" width="76" height="26" rx="5" fill="#f2f4f6" stroke="#d1d6db"/>
+          <rect x="80" y="0" width="140" height="26" rx="5" fill="#3182f6"/>
+          <g fill="#90c2ff">
+            <rect x="224" y="0" width="38" height="26" rx="4"/><rect x="266" y="0" width="38" height="26" rx="4"/><rect x="308" y="0" width="38" height="26" rx="4"/>
+            <rect x="350" y="0" width="38" height="26" rx="4"/><rect x="392" y="0" width="38" height="26" rx="4"/><rect x="434" y="0" width="38" height="26" rx="4"/>
+            <rect x="476" y="0" width="38" height="26" rx="4"/><rect x="518" y="0" width="38" height="26" rx="4"/><rect x="560" y="0" width="38" height="26" rx="4"/>
+            <rect x="602" y="0" width="38" height="26" rx="4"/>
+          </g>
+          <path d="M0 36 v6 h220 v-6" fill="none" stroke="#b0b8c1" stroke-width="1.5"/>
+          <text x="110" y="58" fill="#4e5968" font-size="12" text-anchor="middle">TTFT</text>
+          <path d="M224 36 v6 h38 v-6" fill="none" stroke="#b0b8c1" stroke-width="1.5"/>
+          <text x="243" y="58" fill="#4e5968" font-size="12" text-anchor="middle">TPOT</text>
+        </g>
+        <g transform="translate(60,92)" font-size="13" fill="#4e5968">
+          <rect x="0" y="0" width="12" height="12" rx="3" fill="#f2f4f6" stroke="#d1d6db"/><text x="20" y="11">대기열</text>
+          <rect x="100" y="0" width="12" height="12" rx="3" fill="#3182f6"/><text x="120" y="11">prefill</text>
+          <rect x="200" y="0" width="12" height="12" rx="3" fill="#90c2ff"/><text x="220" y="11">decode 토큰들</text>
+        </g>
+      </svg>
+    </figure>
+    <div class="table-wrap"><table>
+    <tr><th>지표</th><th>뜻</th><th>사용자 체감</th><th>주로 늘리는 원인</th></tr>
+    <tr><td>TTFT<br><small>Time To First Token</small></td><td>요청부터 첫 토큰까지 (대기열 + prefill)</td><td>"반응이 늦다"</td><td>긴 프롬프트, 대기열 적체</td></tr>
+    <tr><td>TPOT / ITL<br><small>Time Per Output Token / Inter-Token Latency</small></td><td>토큰과 토큰 사이 간격</td><td>"글자가 느리게 나온다"</td><td>큰 배치, 큰 모델, 느린 대역폭</td></tr>
+    <tr><td>E2E<br><small>End-to-End latency</small></td><td>TTFT + TPOT × (출력 토큰 − 1)</td><td>"답이 다 나오기까지"</td><td>긴 출력</td></tr>
+    </table></div>
+    <div class="callout info">
+    <span class="label">쉽게 말하면 · 식당으로 비유하면</span>
+    <div class="table-wrap"><table>
+    <tr><th>지표</th><th>식당 비유</th></tr>
+    <tr><td><strong>TTFT</strong></td><td>주문하고 첫 음식이 나오기까지</td></tr>
+    <tr><td><strong>TPOT / ITL</strong></td><td>음식과 음식 사이 간격</td></tr>
+    <tr><td><strong>E2E</strong></td><td>식사가 전부 나오기까지</td></tr>
+    <tr><td><strong>p95</strong></td><td>손님 100명 중 가장 오래 기다린 5명이 기다린 시간</td></tr>
+    </table></div>
+    </div>
+    <p>TPOT과 ITL은 거의 같은 뜻으로, 토큰 간격의 평균을 TPOT, 간격 하나하나를 ITL이라고 부릅니다. 세 지표는 이렇게 이어집니다. TTFT 0.5초, TPOT 50ms, 출력 200토큰이면 E2E는 약 <code>0.5 + 0.05 × 199 ≈ 10.5초</code>입니다.</p>
+    <p>사람이 읽는 속도는 대략 초당 5~10 토큰이므로 스트리밍 채팅이라면 TPOT 100ms 이하, TTFT 1~2초 이하가 흔한 목표입니다. 이때 평균이 아니라 p95, p99(95번째·99번째 백분위수, 즉 느린 쪽 상위 5%·1%)로 봐야 일부 사용자가 겪는 지연이 보입니다. 평균이 괜찮아도 p95가 10초라면 20명 중 1명은 10초 넘게 기다린다는 뜻입니다.</p>
+
+    <h3>Throughput은 latency와 맞바꾼다</h3>
+    <p>처리량은 "GPU 전체가 초당 생성한 토큰 수"(output tok/s) 또는 "초당 처리 요청 수"(req/s)입니다. 동시 요청이 늘면 가중치 읽기 비용이 여러 요청에 나눠져 전체 처리량은 오르지만, 매 스텝에 처리할 일이 많아져 개별 요청의 TPOT은 늘어납니다. 버스에 손님을 많이 태우면 한 번에 많이 실어 나르지만 정류장마다 타고 내리는 시간이 길어지는 것과 같습니다. 어느 지점부터는 처리량은 거의 그대로인데 지연만 늘어나고, 그 직전이 가장 좋은 운영 지점입니다.</p>
+    <div class="table-wrap"><table>
+    <tr><th>동시 요청</th><th>요청별 TPOT</th><th>전체 처리량</th><th>상태</th></tr>
+    <tr><td class="num">1</td><td>가장 짧음</td><td>매우 낮음</td><td>GPU 대부분 놀고 있음</td></tr>
+    <tr><td class="num">8~32</td><td>조금 늘어남</td><td>가파르게 증가</td><td>대역폭을 나눠 쓰며 효율 상승</td></tr>
+    <tr><td class="num">64+</td><td>뚜렷하게 늘어남</td><td>완만해짐</td><td>연산 또는 KV 한계 접근</td></tr>
+    <tr><td>KV 한계 초과</td><td>대기 시간 폭증</td><td>더 오르지 않음</td><td>대기열·선점 발생</td></tr>
+    </table></div>
+    <p>위 표는 경향을 보여 주는 것이고 정확한 꺾이는 지점은 모델·GPU·입출력 길이마다 다릅니다. <code>vllm bench serve</code>(구버전은 <code>benchmark_serving.py</code>)로 동시성을 바꿔 가며 직접 재야 합니다.</p>
+
+    <h2>동시 요청 처리</h2>
+    <p>사용자가 늘 때 무너지는 순서는 거의 항상 같습니다.</p>
+    <ol>
+    <li><strong>TPOT이 서서히 늘어남</strong>: 배치가 커지면서 스텝당 시간이 증가. 아직 정상 범위</li>
+    <li><strong>KV cache가 차고 대기열이 생김</strong>: <code>vllm:num_requests_waiting</code>가 0보다 커짐. 새 요청은 KV 블록이 빌 때까지 기다리므로 TTFT가 급격히 늘어남</li>
+    <li><strong>선점(preemption)</strong>: 진행 중인 요청의 KV가 모자라면 vLLM이 일부 요청을 쫓아냈다가 나중에 처음부터 다시 계산. 같은 일을 두 번 해서 처리량까지 떨어짐. <code>vllm:num_preemptions_total</code>로 확인</li>
+    <li><strong>타임아웃</strong>: 게이트웨이(nginx, Cloudflare 등)의 대기 한도를 넘어 504. 사용자는 "서버가 죽었다"고 느낌</li>
+    </ol>
+    <h3>필요한 동시성 계산: Little의 법칙</h3>
+    <div class="formula">동시 요청 수 = <b>초당 요청 수</b> × <b>요청당 평균 처리 시간(초)</b></div>
+    <p>가게 안 손님 수가 "분당 들어오는 손님 × 한 명이 머무는 시간"인 것과 같은 식입니다. 초당 2건이 들어오고 답변 하나에 평균 15초가 걸리면 늘 30건이 동시에 돌고 있습니다. 이 30건 × 요청당 평균 토큰이 KV 예산 안에 들어와야 대기열 없이 돌아갑니다.</p>
+    <h3>대응 수단</h3>
+    <div class="table-wrap"><table>
+    <tr><th>증상</th><th>먼저 해 볼 것</th></tr>
+    <tr><td>KV 부족·대기열</td><td>FP8 KV cache, <code>--max-model-len</code> 축소, 가중치 양자화로 KV 자리 확보, GPU 추가(TP 또는 복제본)</td></tr>
+    <tr><td>긴 RAG 프롬프트로 TTFT 증가</td><td>prefix caching, 검색 문서 수·청크 길이 줄이기, chunked prefill</td></tr>
+    <tr><td>TPOT 증가</td><td><code>--max-num-seqs</code>로 배치 상한, 더 작은·양자화 모델, 대역폭 높은 GPU</td></tr>
+    <tr><td>선점 반복</td><td><code>--max-num-seqs</code> 낮추기, KV 확보. 선점은 "조금 덜 받는 게 낫다"는 신호</td></tr>
+    <tr><td>사용자별 편차</td><td>게이트웨이에서 사용자당 동시 요청 제한, 출력 토큰 상한(<code>max_tokens</code>)</td></tr>
+    </table></div>
+    <p>TP와 복제본은 목적이 다릅니다. TP는 "한 장에 안 들어가는 모델"을 위한 것이고, 들어가는 모델이라면 같은 GPU 수로 복제본을 여러 개 띄우고 로드밸런서로 나누는 쪽이 GPU 간 통신이 없어 처리량이 더 잘 나옵니다.</p>
+
+    <h2>사례로 다시 보기</h2>
+    <h3>사용자가 10명에서 100명으로 늘면</h3>
+    <p>H100 2장, 70B FP8, 요청당 평균 4K 토큰 가정. KV 예산이 40만 토큰 안팎이면 4K 요청은 동시 100개 남짓이 상한입니다.</p>
+    <ol>
+    <li>10명: 배치가 작아 TPOT 짧음, GPU 대역폭 대부분 낭비</li>
+    <li>50명: 처리량이 크게 오르고 TPOT도 함께 늘어남. 체감은 아직 괜찮음</li>
+    <li>100명 + 긴 RAG 문서: KV 한계 도달, 대기열 발생, TTFT가 수 초에서 수십 초로 튐</li>
+    <li>같은 상태에서 일부가 32K 문서를 넣으면 요청 하나가 4K 요청 8개분 KV를 차지해 선점 발생</li>
+    </ol>
+    <p>그래서 운영에서는 <code>num_requests_waiting</code>, <code>gpu_cache_usage_perc</code>, <code>num_preemptions_total</code>, TTFT p95 네 개를 대시보드에 올려 두고, 대기열이 상시 0이 아니게 되는 시점을 증설 기준으로 잡습니다.</p>
+
+    <h2 id="glossary">용어 사전 (약자 풀이)</h2>
+    <p>3편에 나오는 약자를 모았습니다. SM, DCGM 같은 GPU 용어는 <a href="../llm-serving-runtime/#glossary">2편</a>, KV cache 같은 기본 용어는 <a href="../llm-serving-memory/#glossary">1편</a> 용어 사전에 있습니다.</p>
+    <h3>성능 지표</h3>
+    <div class="table-wrap"><table>
+    <tr><th>약자</th><th>풀네임</th><th>쉬운 뜻</th></tr>
+    <tr><td>TTFT</td><td>Time To First Token</td><td>첫 글자가 나오기까지 걸린 시간</td></tr>
+    <tr><td>TPOT</td><td>Time Per Output Token</td><td>글자 하나가 더 나오는 데 걸리는 평균 시간</td></tr>
+    <tr><td>ITL</td><td>Inter-Token Latency</td><td>글자와 글자 사이 간격 (개별 측정값)</td></tr>
+    <tr><td>E2E</td><td>End-to-End latency</td><td>요청부터 답이 끝날 때까지 전체 시간</td></tr>
+    <tr><td>p95 / p99</td><td>95th / 99th percentile</td><td>느린 쪽 상위 5% / 1% 기준 값</td></tr>
+    <tr><td>tok/s</td><td>tokens per second</td><td>초당 만들어 내는 토큰 수</td></tr>
+    <tr><td>req/s</td><td>requests per second</td><td>초당 처리하는 요청 수</td></tr>
+    <tr><td>RAG</td><td>Retrieval-Augmented Generation</td><td>문서를 검색해서 프롬프트에 붙여 답하게 하는 방식</td></tr>
+    </table></div>
+
+    <p class="caption">메모리·속도 수치는 공개된 모델 구조와 GPU 사양으로 계산한 근사치입니다. 실제 값은 vLLM 버전, 커널, 입출력 길이에 따라 달라지므로 기동 로그와 벤치마크로 확인하세요.</p>
+
+    <nav class="series-pager" aria-label="이전·다음 편">
+      <a href="../llm-serving-runtime/"><span>← 이전 2편</span>GPU 위에서 모델이 돌아가는 방식</a>
+    </nav>
+  </main>
+  <footer class="site-footer">naelog · dev</footer>
+  <script src="../../assets/edit.js"></script>
+</body>
+</html>

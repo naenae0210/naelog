@@ -14,12 +14,12 @@
 
 ```bash
 npm install
-npm run dev      # http://localhost:4321/naedevlog/
+npm run dev      # http://localhost:4321/naelog/
 ```
 
 ## GitHub Pages 배포
 
-1. GitHub에 `naedevlog` 저장소를 만들고 이 폴더를 push한다.
+1. GitHub에 `naelog` 저장소를 만들고 이 폴더를 push한다.
 2. `astro.config.mjs`의 `site`를 `https://<내 아이디>.github.io`로 바꾼다. 저장소 이름이 다르면 `base`도 바꾼다.
 3. 저장소 Settings → Pages → Source를 **GitHub Actions**로 바꾼다.
 4. `main`에 push하면 `.github/workflows/deploy.yml`이 빌드하고 배포한다.

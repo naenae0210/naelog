@@ -5,7 +5,7 @@ import path from 'node:path';
 import { DEFAULT_LOG, LOGS, logOf } from './logs';
 
 export interface PostInfo {
-  slug: string; lang: 'ko' | 'en'; log: string; title: string; description: string;
+  slug: string; lang: 'ko' | 'en'; log: string; title: string; description: string; series: string; part: number;
   date: string; category: string; tags: string[]; draft: boolean;
 }
 
@@ -36,17 +36,20 @@ export function getPosts(lang: 'ko' | 'en' = 'ko'): PostInfo[] {
         category: meta(html, 'post:category') || '기타',
         // 태그는 쉼표로 나눈다. 태그 안의 쉼표는 \, 로 쓴다 (예: Peau noire\, masques blancs)
         tags: meta(html, 'post:tags').split(/(?<!\\),/).map((t) => t.replace(/\\,/g, ',').trim()).filter(Boolean),
+        // 시리즈 글의 편 번호. 같은 날짜면 뒤 편이 위로 온다
+        series: meta(html, 'post:series'),
+        part: Number(meta(html, 'post:part')) || 0,
         draft: meta(html, 'post:draft') === 'true',
       };
     })
     .filter((p) => !p.draft)
-    .sort((a, b) => b.date.localeCompare(a.date));
+    .sort((a, b) => b.date.localeCompare(a.date) || b.part - a.part);
 }
 
 // 목록 화면에 보일 글. 영어 목록은 영어판이 있는 로그(dev)는 영어 글, 나머지는 한국어 글을 보여 준다.
 export function listPosts(lang: 'ko' | 'en', log?: string): PostInfo[] {
   const all = lang === 'en'
-    ? [...getPosts('en'), ...getPosts('ko').filter((p) => !logOf(p.log).enPosts)].sort((a, b) => b.date.localeCompare(a.date))
+    ? [...getPosts('en'), ...getPosts('ko').filter((p) => !logOf(p.log).enPosts)].sort((a, b) => b.date.localeCompare(a.date) || b.part - a.part)
     : getPosts();
   return all.filter((p) => !log || p.log === log);
 }

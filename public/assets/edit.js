@@ -5,7 +5,7 @@
 (function () {
   const me = document.currentScript;
   if (!me) return;
-  const base = new URL('../', me.src).pathname;            // 예: /naedevlog/
+  const base = new URL('../', me.src).pathname;            // 예: /naelog/
   const api = (p) => base + '__edit/' + p + '/';
   const m = location.pathname.match(/\/(en\/)?posts\/([^/]+)\/?/) || [];
   const slug = m[2], lang = m[1] ? 'en' : 'ko';

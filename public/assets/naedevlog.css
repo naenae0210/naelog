@@ -168,6 +168,21 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .source-by { display: block; margin-top: 4px; font-size: 14px; color: var(--sub); }
 .source-url { display: block; margin-top: 8px; font-size: 13px; color: var(--faint); overflow-wrap: anywhere; }
 
+/* 시리즈 글: 위쪽 편 목록, 아래쪽 이전/다음 편 */
+.series { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; margin: 8px 0 40px; }
+.series-label { grid-column: 1 / -1; font-size: 13px; font-weight: 700; color: var(--faint); }
+.series a { display: block; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; color: var(--text); font-size: 15px; font-weight: 600; line-height: 1.5; }
+.series a span { display: block; font-size: 12px; font-weight: 600; color: var(--faint); margin-bottom: 2px; }
+.series a small { display: block; font-size: 13px; font-weight: 400; color: var(--sub); margin-top: 2px; }
+.series a:hover { text-decoration: none; border-color: var(--line-strong); }
+.series a[aria-current="page"] { border-color: var(--blue); }
+.series a[aria-current="page"] span { color: var(--blue); }
+.series-pager { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 56px; padding-top: 28px; border-top: 1px solid var(--line); }
+.series-pager a { flex: 1 1 220px; border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px; color: var(--text); font-weight: 600; }
+.series-pager a span { display: block; font-size: 12px; color: var(--faint); }
+.series-pager a.next { text-align: right; }
+.series-pager a:hover { text-decoration: none; border-color: var(--line-strong); }
+
 .post-foot { margin-top: 80px; padding-top: 28px; border-top: 1px solid var(--line); }
 .post-foot .next-label { font-size: 14px; font-weight: 700; color: var(--faint); margin-bottom: 10px; }
 .post-foot ul { list-style: none; padding: 0; }

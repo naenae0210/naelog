@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Why Doesn&#x27;t 70B Fit on One A100? GPU Memory and Quantization · naelog</title>
+  <meta name="description" content="Part 1 of the LLM serving notes: splitting GPU memory into weights, KV cache and overhead, and choosing quantization per GPU generation." />
+  <!-- 홈 목록에 쓰이는 정보 -->
+  <meta name="post:log" content="dev" />
+  <meta name="post:date" content="2026-11-23" />
+  <meta name="post:series" content="LLM Serving" />
+  <meta name="post:part" content="1" />
+  <meta name="post:category" content="GPU &amp; Inference" />
+  <meta name="post:tags" content="LLM Serving, vLLM, Quantization, KV Cache" />
+  <link rel="stylesheet" href="../../../assets/naedevlog.css" />
+  <link rel="alternate" hreflang="ko" href="../../../posts/llm-serving-memory/" />
+  <script src="../../../assets/site.js"></script>
+  <style>
+    /* 설명이 긴 표는 칸 안에서 줄바꿈한다 */
+    .table-wrap td:not(.num) { white-space: normal; min-width: 7em; }
+    .table-wrap th { white-space: nowrap; }
+    .ctrls { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 14px 18px; margin-bottom: 20px; }
+    .ctrls label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; color: var(--sub); }
+    .verdict { border-radius: 12px; padding: 14px 18px; margin: 4px 0 18px; font-size: 15px; line-height: 1.6; }
+    .verdict .pill { margin-right: 6px; }
+    .verdict.ok { background: var(--blue-soft); color: var(--blue); }
+    .verdict.warn, .verdict.bad { background: var(--warn-soft); color: var(--warn); }
+    .cap { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 13px; color: var(--faint); }
+    .bar { display: flex; height: 28px; border-radius: 8px; overflow: hidden; background: var(--surface-2); margin: 6px 0 0; }
+    .bar i { display: block; height: 100%; transition: width .25s; }
+    .bar .w { background: var(--blue); } .bar .o { background: var(--gray-bar); }
+    .bar .kv { background: var(--blue-light); } .bar .over { background: var(--warn); }
+    .bar-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; color: var(--sub); margin-top: 10px; }
+    .bar-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; margin-top: 18px; }
+    .stat { background: var(--bg); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+    .stat small { display: block; font-size: 12.5px; color: var(--faint); font-weight: 600; }
+    .stat b { font-size: 20px; font-weight: 800; font-variant-numeric: tabular-nums; }
+    .stat em { font-style: normal; font-size: 12.5px; color: var(--sub); margin-left: 3px; }
+    .fine { font-size: 13px; color: var(--faint); margin: 14px 0 0; }
+  </style>
+</head>
+<body>
+  <header class="site-header"><div class="inner">
+    <a class="logo" href="../../">naelog</a>
+    <nav class="nav">
+      <a href="../../dev/" aria-current="page">dev</a>
+      <a href="../../book/">book</a>
+      <a href="../../scrap/">scrap</a>
+    </nav>
+  </div></header>
+
+  <main class="wrap">
+    <div class="category">LLM Serving · Part 1</div>
+    <h1>Why Doesn't 70B Fit on One A100? GPU Memory and Quantization</h1>
+    <p class="lead">Getting <code>vllm serve</code> to run is one thing; holding up as a service is another. Part 1 covers the first hurdle: calculating GPU memory, and quantization to shrink it.</p>
+    <div class="post-meta">
+      <span>2026.11.23</span><span class="dot"></span><span>15 min</span>
+      <span class="tag">LLM Serving</span><span class="tag">vLLM</span><span class="tag">Quantization</span><span class="tag">KV Cache</span>
+    </div>
+
+    <nav class="series" aria-label="LLM serving series">
+      <div class="series-label">LLM serving notes · 3 parts</div>
+      <a href="../llm-serving-memory/" aria-current="page"><span>Part 1 · reading now</span>Memory and quantization<small>Why doesn't 70B fit on one A100?</small></a>
+      <a href="../llm-serving-runtime/"><span>Part 2</span>How a model runs on the GPU<small>Why do answers come out one token at a time?</small></a>
+      <a href="../llm-serving-operations/"><span>Part 3</span>Performance and operations<small>What breaks first at 100 users?</small></a>
+    </nav>
+
+    <p>This part asks one question: <strong>"Does this model fit on this GPU, and if it does, how many users' worth of room is left?"</strong> Most OOM (out of memory) errors happen when a model is launched without answering that question in numbers.</p>
+    <ol>
+    <li><strong>Memory</strong>: split GPU memory into three parts (weights, KV cache, overhead) and calculate each</li>
+    <li><strong>Quantization</strong>: store numbers in fewer bits to save memory, and pick the right method per GPU</li>
+    <li><strong>Calculator</strong>: change the conditions and see exactly where OOM happens</li>
+    <li><strong>Cases</strong>: apply it to two situations that come up all the time</li>
+    </ol>
+    <p>By the end you can explain "why 70B in BF16 does not fit on one A100" with a single multiplication. Unfamiliar abbreviations are in the <a href="#glossary">glossary</a> at the bottom.</p>
+    <h2>GPU memory and model size</h2>
+    <p>VRAM splits into three parts: weights, KV cache, and everything else (overhead). If you only calculate the first, you will be wrong.</p>
+    <div class="callout info">
+    <span class="label">In plain words · GPU memory is a desk</span>
+    <p>Think of GPU memory (VRAM) as a <strong>desk</strong>. Three things have to fit on it.</p>
+    <div class="table-wrap"><table>
+    <tr><th>Part</th><th>Analogy</th><th>What it does</th></tr>
+    <tr><td><strong>Weights</strong></td><td>A thick encyclopedia</td><td>What the model has learned</td></tr>
+    <tr><td><strong>KV cache</strong></td><td>A conversation notepad</td><td>Space to write down the conversation so far</td></tr>
+    <tr><td><strong>Overhead</strong></td><td>Pens and a desk lamp</td><td>Odds and ends the program needs to run (2 to 4GB)</td></tr>
+    </table></div>
+    <p>If the desk is too small, the encyclopedia does not fit (loading OOM). If the encyclopedia fits but there is no room for notepads, you cannot take any users (not enough KV).</p>
+    </div>
+
+    <h3>Weights: parameter count × bytes per parameter</h3>
+    <div class="formula">Weight memory = <b>parameter count</b> × <b>bytes per parameter</b></div>
+    <div class="table-wrap"><table>
+    <tr><th>Model</th><th>BF16 (2B)</th><th>FP8 / INT8 (1B)</th><th>INT4 (≈0.55B, with scales)</th></tr>
+    <tr><td>8B</td><td class="num">16 GB</td><td class="num">8 GB</td><td class="num">4.4 GB</td></tr>
+    <tr><td>32B</td><td class="num">64 GB</td><td class="num">32 GB</td><td class="num">17.6 GB</td></tr>
+    <tr><td>70B</td><td class="num">140 GB</td><td class="num">70 GB</td><td class="num">38.5 GB</td></tr>
+    <tr><td>405B</td><td class="num">810 GB</td><td class="num">405 GB</td><td class="num">223 GB</td></tr>
+    </table></div>
+    <p>"70B" means the model has 70 billion parameters (numbers it learned), and the 2B and 1B in the table header are the bytes one parameter takes. So 70B in BF16 is <code>70 billion × 2 bytes = 140GB</code>, 140GB of weights alone. It never fits on a single 80GB card. It is not a misconfiguration; the arithmetic simply does not work, and this is the most common OOM there is.</p>
+
+    <h3>KV cache: grows with concurrent requests and context length</h3>
+    <p>To understand the KV cache, you first need to know a little about how the model is built. ChatGPT, Llama, Claude, Qwen and almost every LLM today use an architecture called the <strong>Transformer</strong>. The T in GPT is Transformer (Generative Pre-trained Transformer), and it first appeared in Google's 2017 paper "Attention Is All You Need".</p>
+    <p>A Transformer is <strong>dozens of identical layers stacked on top of each other</strong>. Llama 3.1 70B has 80. A token climbs from the bottom layer up, understood more deeply at each step, and the top layer picks the next token. Each layer uses <strong>attention</strong> to look at which earlier tokens to refer to, and <strong>feed-forward</strong> to process what it found. Attention works like looking things up in a library: every token produces three values.</p>
+    <div class="table-wrap"><table>
+    <tr><th>Value</th><th>In a library</th><th>Role</th></tr>
+    <tr><td><strong>Query</strong></td><td>The question I am asking</td><td>"Right now I need this kind of information"</td></tr>
+    <tr><td><strong>Key</strong></td><td>The label on a book's spine</td><td>"This is what I contain"</td></tr>
+    <tr><td><strong>Value</strong></td><td>The book's actual content</td><td>The information you take once you find it</td></tr>
+    </table></div>
+    <p>In "Chulsoo bought an apple. He…", when processing "He", matching the Query of "He" against the Keys of earlier tokens shows "Chulsoo" fits best. So the model takes Chulsoo's Value and understands "He = Chulsoo".</p>
+    <p>In other words, every new token needs <strong>the Keys and Values of all earlier tokens</strong>. Recomputing them each time would be wasteful, so the Transformer stores the Key and Value of every processed token in every layer and reuses them. That storage is the <strong>KV cache</strong>, the conversation notepad in the analogy above. Each of the 80 layers makes its own Keys and Values, which is why the formula below multiplies by the number of layers. And the longer the conversation, the thicker the notepad; the more users, the more notepads, so the total grows with length and user count.</p>
+    <div class="formula">KV per token = 2(K,V) × <b>layers</b> × <b>KV heads</b> × <b>head dim</b> × <b>bytes</b></div>
+    <p>For Llama 3.1 70B (80 layers, 8 KV heads, head dim 128, BF16) that is <code>2×80×8×128×2 = 327,680 B</code> per token, about 0.33MB.</p>
+    <div class="table-wrap"><table>
+    <tr><th>70B, BF16 KV</th><th>1 request</th><th>16 concurrent</th><th>64 concurrent</th></tr>
+    <tr><td>4K context</td><td class="num">1.3 GB</td><td class="num">21 GB</td><td class="num">86 GB</td></tr>
+    <tr><td>8K context</td><td class="num">2.7 GB</td><td class="num">43 GB</td><td class="num">172 GB</td></tr>
+    <tr><td>32K context</td><td class="num">10.7 GB</td><td class="num">172 GB</td><td class="num">687 GB</td></tr>
+    </table></div>
+    <p>One 8K conversation is 2.7GB, but 64 people at once is 172GB. Even if the weights just barely fit, there is no service without room for the notepads. Put the other way: securing enough KV space is what concurrency is.</p>
+
+    <h3>Overhead: the 2 to 4GB people forget</h3>
+    <ul>
+    <li><strong>CUDA context</strong>: 0.5 to 1GB the moment a process grabs the GPU</li>
+    <li><strong>Activations</strong>: intermediate tensors during prefill. Larger the longer the prompt processed at once</li>
+    <li><strong>CUDA graph</strong>: graphs vLLM captures ahead of time for decode speed, hundreds of MB to a few GB</li>
+    <li><strong>Other processes</strong>: an embedding server or Jupyter kernel on the same GPU. Check <code>nvidia-smi</code> first</li>
+    </ul>
+    <figure class="figure">
+      <svg viewBox="0 0 700 190" role="img" aria-label="Memory layout of 70B INT4 on an A100 80GB" font-family="Pretendard Variable, Pretendard, sans-serif">
+        <text x="0" y="16" fill="#4e5968" font-size="14" font-weight="600">A100 80GB · 70B INT4 example</text>
+        <g transform="translate(0,36)">
+          <!-- 700px = 80GB -->
+          <rect x="0" y="0" width="700" height="52" rx="8" fill="#f2f4f6"/>
+          <rect x="0" y="0" width="337" height="52" rx="8" fill="#3182f6"/>
+          <rect x="325" y="0" width="12" height="52" fill="#3182f6"/>
+          <rect x="337" y="0" width="26" height="52" fill="#b0b8c1"/>
+          <rect x="363" y="0" width="267" height="52" fill="#90c2ff"/>
+          <text x="18" y="32" fill="#fff" font-size="15" font-weight="700">Weights 38.5GB</text>
+          <text x="496" y="32" fill="#191f28" font-size="14" font-weight="700" text-anchor="middle">KV cache ≈30GB</text>
+          <text x="665" y="32" fill="#8b95a1" font-size="13" font-weight="700" text-anchor="middle">8</text>
+          <path d="M0 66 v8 h630 v-8" fill="none" stroke="#b0b8c1" stroke-width="1.5"/>
+          <text x="315" y="94" fill="#4e5968" font-size="13" text-anchor="middle">gpu-memory-utilization 0.9 = uses up to 72GB</text>
+          <path d="M633 66 v8 h67 v-8" fill="none" stroke="#d1d6db" stroke-width="1.5"/>
+          <text x="666" y="94" fill="#8b95a1" font-size="12" text-anchor="middle">Unreserved</text>
+        </g>
+        <g transform="translate(0,160)" font-size="14" fill="#4e5968">
+          <rect x="0" y="0" width="12" height="12" rx="3" fill="#3182f6"/><text x="20" y="11">Weights</text>
+          <rect x="110" y="0" width="12" height="12" rx="3" fill="#b0b8c1"/><text x="130" y="11">Overhead ≈3GB</text>
+          <rect x="280" y="0" width="12" height="12" rx="3" fill="#90c2ff"/><text x="300" y="11">KV cache</text>
+          <rect x="410" y="0" width="12" height="12" rx="3" fill="#f2f4f6" stroke="#d1d6db"/><text x="430" y="11">Unreserved 8GB</text>
+        </g>
+      </svg>
+      <figcaption>What is left after weights and overhead is the KV cache, which is how many users you can take at once.</figcaption>
+    </figure>
+
+    <h2>Quantization</h2>
+    <p>A technique that represents weights (and, if needed, activations and KV) in fewer bits to cut memory and bandwidth. You choose based on three things: GPU generation, how much quality loss you can accept, and what the serving engine supports.</p>
+    <div class="callout info">
+    <span class="label">In plain words · Quantization is photo compression</span>
+    <p>Compress a high-resolution photo to JPG and the file shrinks a lot while looking almost the same. Quantization is the same idea: store each number in 8 or 4 bits instead of 16, and a 70B model shrinks from 140GB to 70GB, or about 38.5GB.</p>
+    <p>But a compressed photo is not the original, and the more you shrink it the more the detail blurs. So the GPU generation decides which formats you can use, and real work questions decide how far you can shrink.</p>
+    </div>
+    <div class="table-wrap"><table>
+    <tr><th>Method</th><th>Bits</th><th>What it shrinks</th><th>Quality</th><th>GPUs</th></tr>
+    <tr><td>BF16 / FP16</td><td class="num">16</td><td>Baseline</td><td>Original</td><td>All</td></tr>
+    <tr><td>FP8 (W8A8)</td><td class="num">8</td><td>Weights and activations, compute in FP8 too</td><td>Nearly lossless</td><td>Ada (L40S, 4090), Hopper (H100/H200), Blackwell</td></tr>
+    <tr><td>INT8 W8A8 (SmoothQuant)</td><td class="num">8</td><td>Weights and activations</td><td>Nearly lossless</td><td>Ampere (A100, A6000)</td></tr>
+    <tr><td>AWQ / GPTQ (W4A16)</td><td class="num">4</td><td>Weights only, compute in FP16</td><td>Some loss, shows first in math and code</td><td>All, fast with Marlin kernels</td></tr>
+    <tr><td>NVFP4 / MXFP4</td><td class="num">4</td><td>Weights and activations</td><td>Depends on the calibration recipe</td><td>Blackwell (B200)</td></tr>
+    <tr><td>GGUF (Q4_K_M etc.)</td><td class="num">2~8</td><td>Weights</td><td>Varies by level</td><td>For llama.cpp and Ollama. Not recommended for large-scale vLLM serving</td></tr>
+    <tr><td>FP8 KV cache</td><td class="num">8</td><td>KV cache only</td><td>Usually small impact</td><td><code>--kv-cache-dtype fp8</code></td></tr>
+    </table></div>
+    <h3>How to choose</h3>
+    <ol>
+    <li><strong>If it fits in BF16 with plenty of KV</strong>, do not quantize. Quality validation costs nothing.</li>
+    <li><strong>On Hopper or Ada, start with FP8</strong>. Half the memory, faster compute, and almost no quality loss.</li>
+    <li><strong>On Ampere, INT8 W8A8 or AWQ INT4</strong>. The A100 has no FP8 tensor cores, so an FP8 checkpoint only saves memory, with no compute gain.</li>
+    <li><strong>If it still does not fit, INT4</strong>. Always compare it against BF16 on a set of real work questions.</li>
+    <li><strong>If concurrency is the problem, FP8 KV cache</strong>. The same memory holds twice as many KV tokens.</li>
+    </ol>
+    <div class="callout warn-box"><span class="label">A common mistake</span><p>Quantization is not "a smaller model"; it is "an approximation of the same model". 70B INT4 is usually better than 32B BF16, but long-context reasoning and numerical calculation have to be checked directly on your own work data.</p></div>
+
+    <h2>VRAM calculator</h2>
+    <p>Change the conditions to see where OOM happens and how many concurrent users you can take. The defaults are 70B in BF16 on a single A100 80GB; change them in the order below and the memory and quantization sections show up as numbers.</p>
+    <ol>
+    <li>Leave the defaults (70B, BF16, one A100) and confirm you see <strong>"Loading OOM"</strong></li>
+    <li>Switch weight precision to <strong>INT4</strong> and see how many concurrent requests it can take once it starts</li>
+    <li>Switch the GPU to <strong>H100</strong>, the count to <strong>2</strong> and precision to <strong>FP8</strong>, and see how much room opens up</li>
+    <li>Raise <strong>concurrent requests</strong> until you hit "Queueing"</li>
+    </ol>
+    <div class="figure" id="calc">
+      <div class="ctrls">
+        <label for="m">Model<select id="m">
+          <option value="8">8B (Llama 3.1 8B architecture)</option>
+          <option value="14">14B (Qwen2.5 14B architecture)</option>
+          <option value="32">32B (Qwen2.5 32B architecture)</option>
+          <option value="70" selected>70B (Llama 3.1 70B architecture)</option>
+          <option value="405">405B (Llama 3.1 405B architecture)</option>
+        </select></label>
+        <label for="q">Weight precision<select id="q">
+          <option value="2" selected>BF16 / FP16</option>
+          <option value="1">FP8 / INT8</option>
+          <option value="0.55">INT4 (AWQ/GPTQ)</option>
+        </select></label>
+        <label for="kvq">KV cache precision<select id="kvq">
+          <option value="2" selected>BF16</option>
+          <option value="1">FP8</option>
+        </select></label>
+        <label for="g">GPU<select id="g">
+          <option value="24|1008">RTX 4090 24GB</option>
+          <option value="48|768">RTX A6000 48GB</option>
+          <option value="48|864">L40S 48GB</option>
+          <option value="80|2039" selected>A100 80GB</option>
+          <option value="80|3350">H100 80GB SXM</option>
+          <option value="141|4800">H200 141GB</option>
+          <option value="180|8000">B200 180GB</option>
+        </select></label>
+        <label for="tp">GPUs (tensor parallel)<select id="tp">
+          <option value="1" selected>1</option><option value="2">2</option><option value="4">4</option><option value="8">8</option>
+        </select></label>
+        <label for="util">gpu-memory-utilization<input id="util" type="number" min="0.5" max="0.98" step="0.01" value="0.90"></label>
+        <label for="ctx">Tokens per request (in+out)<input id="ctx" type="number" min="512" max="131072" step="512" value="8192"></label>
+        <label for="cc">Concurrent requests<input id="cc" type="number" min="1" max="1024" step="1" value="16"></label>
+      </div>
+
+      <div class="verdict" id="verdict"><strong class="pill">Verdict</strong> <span></span></div>
+
+      <div class="cap"><span>Total memory across GPUs</span><span id="capTxt"></span></div>
+      <div class="bar" id="bar"><i class="w"></i><i class="o"></i><i class="kv"></i><i class="over"></i></div>
+      <div class="bar-legend"><span><i style="background:var(--blue)"></i>Weights</span><span><i style="background:var(--gray-bar)"></i>Overhead</span><span><i style="background:var(--blue-light)"></i>Required KV cache</span><span><i style="background:var(--warn)"></i>Over budget</span><span><i style="background:var(--surface-2)"></i>Free</span></div>
+
+      <div class="stats">
+        <div class="stat"><small>Weights (per GPU)</small><b id="sW">–</b><em>GB</em></div>
+        <div class="stat"><small>KV budget (total)</small><b id="sKV">–</b><em>GB</em></div>
+        <div class="stat"><small>KV tokens that fit</small><b id="sTok">–</b><em>tokens</em></div>
+        <div class="stat"><small>Max concurrency at this length</small><b id="sMax">–</b><em></em></div>
+        <div class="stat"><small>Single-request decode ceiling</small><b id="sTps">–</b><em>tok/s</em></div>
+      </div>
+      <p class="fine">An approximation. Overhead is assumed to be 3GB per GPU, and decode speed is the bandwidth ceiling ("read the weights once per token") times 60% efficiency. Check the real numbers in the <code>GPU KV cache size</code> line of the vLLM startup log.</p>
+    </div>
+
+    <h2>Back to real cases</h2>
+    <h3>70B on a single A100 80GB, and it OOMs</h3>
+    <p>The math: BF16 weights are 140GB, usable memory is 80 × 0.9 = 72GB. You get <code>CUDA out of memory</code> while loading the weights. It is not a configuration problem; it is an arithmetic problem.</p>
+    <p>Switching to FP8 on an H100 80GB still gives 70GB of weights plus about 3GB of overhead, which goes over or nearly fills 72GB, and you get <code>No available memory for the cache blocks</code>. "The weights fit" and "the service works" are different things.</p>
+    <p><strong>Options</strong></p>
+    <ul>
+    <li>Stay on one A100: AWQ INT4 (about 38.5GB) leaves about 30GB of KV → 11 concurrent at 8K; if FP8 KV is not supported, that is as far as it goes</li>
+    <li>Two A100s, TP=2: INT8 W8A8 (35GB per card) leaves about 68GB of KV in total → around 25 concurrent at 8K</li>
+    <li>Two H100s, TP=2: FP8 weights + FP8 KV → 50+ concurrent at 8K with minimal quality loss</li>
+    </ul>
+    <p><strong>To sum up</strong>, memory math, quantization, GPU generation (<a href="../llm-serving-runtime/">part 2</a>) and concurrency (<a href="../llm-serving-operations/">part 3</a>) all connect into one calculation. Ask in order "does the encyclopedia fit on the desk → how many people's notepads fit" and you know which GPU and which format to use.</p>
+
+    <h3>Which quantization should I use?</h3>
+    <ul>
+    <li><strong>You have H100 or L40S</strong>: FP8. Hardly anything to think about</li>
+    <li><strong>You only have A100 or A6000</strong>: AWQ INT4 (Marlin kernels) if memory is tight, INT8 W8A8 if there is room</li>
+    <li><strong>24GB cards like the RTX 4090</strong>: 70B does not fit on one card even in INT4. Even two cards with TP leave almost no KV, so no real service. 32B INT4 or 8B-class models are the realistic range</li>
+    <li><strong>Always</strong>: decide after comparing 100 to 200 work questions side by side against BF16. A small gap on public benchmarks can still fall apart in a specific domain</li>
+    </ul>
+
+    <h2 id="glossary">Glossary</h2>
+    <p>Abbreviations used in part 1. GPU and driver terms are in the <a href="../llm-serving-runtime/#glossary">part 2</a> glossary, performance metrics in the <a href="../llm-serving-operations/#glossary">part 3</a> glossary.</p>
+    <h3>Basics</h3>
+    <div class="table-wrap"><table>
+    <tr><th>Term</th><th>Full name</th><th>Plain meaning</th></tr>
+    <tr><td>LLM</td><td>Large Language Model</td><td>Models like ChatGPT and Llama</td></tr>
+    <tr><td>Transformer</td><td>Transformer</td><td>The architecture almost every LLM uses. Dozens of stacked layers, each using Attention to look at earlier tokens. Explained in the KV cache section above</td></tr>
+    <tr><td>GPU</td><td>Graphics Processing Unit</td><td>A chip where thousands of small workers compute at once</td></tr>
+    <tr><td>CUDA</td><td>Compute Unified Device Architecture</td><td>NVIDIA's platform for giving work to the GPU</td></tr>
+    <tr><td>VRAM</td><td>Video RAM</td><td>The memory on a GPU. "Desk size"</td></tr>
+    <tr><td>HBM</td><td>High Bandwidth Memory</td><td>Very fast memory on data center GPUs. Sets decode speed</td></tr>
+    <tr><td>OOM</td><td>Out Of Memory</td><td>The out-of-memory error</td></tr>
+    <tr><td>B (70B etc.)</td><td>Billion</td><td>70B = 70 billion parameters</td></tr>
+    <tr><td>B (2B, 1B etc.)</td><td>Byte</td><td>When it appears in parentheses next to a precision, as in "BF16 (2B)" in the weights table, it means <strong>the size of one parameter</strong>. 1 byte = 8 bits. Easy to confuse with the B (billion) in model sizes</td></tr>
+    <tr><td>Token</td><td>token</td><td>The unit a model cuts text into. Roughly one or two characters in Korean</td></tr>
+    </table></div>
+    <h3>Memory and quantization</h3>
+    <div class="table-wrap"><table>
+    <tr><th>Term</th><th>Full name</th><th>Plain meaning</th></tr>
+    <tr><td>KV cache</td><td>Key-Value cache</td><td>The "conversation notepad" for tokens already processed</td></tr>
+    <tr><td>BF16</td><td>Brain Floating Point 16-bit</td><td>2 bytes per number. The baseline format (made by Google Brain)</td></tr>
+    <tr><td>FP16 / FP8 / FP4</td><td>Floating Point 16/8/4-bit</td><td>Decimal numbers stored in 16/8/4 bits</td></tr>
+    <tr><td>INT8 / INT4</td><td>Integer 8/4-bit</td><td>Numbers stored as integers in 8/4 bits</td></tr>
+    <tr><td>2B / 1B / ≈0.55B</td><td>Bytes per parameter</td><td>BF16 is 16 bits = 2 bytes, FP8 and INT8 are 8 bits = 1 byte, INT4 is 4 bits = 0.5 bytes plus scales, about 0.55 bytes. Bits ÷ 8 = bytes. For a 70B model that is 140GB, 70GB and about 38.5GB</td></tr>
+    <tr><td>Scale</td><td>scale</td><td>A 4-bit integer can only hold 16 values (-8 to 7), so weights are grouped about 128 at a time and each group stores a multiplier, "one integer step = this much real value". At use time <code>integer × scale</code> brings it back close to the original. Like a map's scale (1cm = 1km). The scales take memory too, which is why INT4 is about 0.55 bytes, not 0.5</td></tr>
+    <tr><td>W8A8 / W4A16</td><td>Weight 8-bit, Activation 8-bit etc.</td><td>How many bits weights (W) and intermediate values (A) use</td></tr>
+    <tr><td>AWQ</td><td>Activation-aware Weight Quantization</td><td>A 4-bit method that protects the important weights</td></tr>
+    <tr><td>GPTQ</td><td>GPT Quantization</td><td>A 4-bit method that shrinks a trained model while correcting the error</td></tr>
+    <tr><td>GGUF</td><td>(llama.cpp file format)</td><td>Model files for Ollama and llama.cpp. For personal PCs</td></tr>
+    <tr><td>NVFP4 / MXFP4</td><td>NVIDIA FP4 / Microscaling FP4</td><td>4-bit formats for Blackwell GPUs</td></tr>
+    </table></div>
+
+    <p class="caption">Memory and speed figures are approximations calculated from published model architectures and GPU specs. Real values vary with the vLLM version, kernels and input/output length, so confirm them with startup logs and benchmarks.</p>
+
+    <nav class="series-pager" aria-label="Previous and next part">
+      <a class="next" href="../llm-serving-runtime/"><span>Part 2 →</span>How a model runs on the GPU</a>
+    </nav>
+  </main>
+  <footer class="site-footer">naelog · dev</footer>
+
+  <script>
+    (function () {
+      // layers, KV heads, head dim
+      var M = {8: [32, 8, 128], 14: [48, 8, 128], 32: [64, 8, 128], 70: [80, 8, 128], 405: [126, 8, 128]};
+      var OVH = 3; // overhead per GPU, GB
+      var $ = function (id) { return document.getElementById(id); };
+      function fmt(n, d) { return n.toLocaleString('en-US', {maximumFractionDigits: d == null ? 1 : d, minimumFractionDigits: 0}); }
+      function run() {
+        var p = +$('m').value, bpp = +$('q').value, kvb = +$('kvq').value;
+        var g = $('g').value.split('|'), mem = +g[0], bw = +g[1];
+        var tp = +$('tp').value, util = Math.min(Math.max(+$('util').value || 0.9, 0.5), 0.98);
+        var ctx = Math.max(+$('ctx').value || 1, 1), cc = Math.max(+$('cc').value || 1, 1);
+        var a = M[p], perTok = 2 * a[0] * a[1] * a[2] * kvb; // bytes
+        var wTot = p * bpp, wPer = wTot / tp;
+        var usable = mem * util, capTot = mem * tp;
+        var kvBudgetPer = usable - wPer - OVH, kvBudget = Math.max(kvBudgetPer, 0) * tp;
+        var kvNeed = perTok * ctx * cc / 1e9;
+        var tokens = kvBudget * 1e9 / perTok, maxCc = Math.floor(tokens / ctx);
+        var tps = (bw * tp * 0.6) / wTot;
+
+        var v = $('verdict'), cls, pill, msg;
+        if (wPer > usable) { cls = 'bad'; pill = 'Loading OOM'; msg = 'Each GPU must hold ' + fmt(wPer) + 'GB of weights but only ' + fmt(usable) + 'GB is usable. Loading the weights fails with CUDA out of memory.'; }
+        else if (kvBudgetPer <= 0.5) { cls = 'bad'; pill = 'No KV room'; msg = 'The weights fit, but after overhead there is almost no room for the KV cache. vLLM fails to start with "No available memory for the cache blocks".'; }
+        else if (maxCc < 1) { cls = 'bad'; pill = 'Too long'; msg = 'There is not enough KV for even one request (' + fmt(ctx, 0) + ' tokens). Lower --max-model-len to ' + fmt(Math.floor(tokens), 0) + ' or less to start.'; }
+        else if (maxCc < cc) { cls = 'warn'; pill = 'Queueing'; msg = 'It starts, but at this length only ' + maxCc + ' requests fit in KV at once. The other ' + (cc - maxCc) + ' wait or get preempted, and TTFT grows a lot.'; }
+        else { cls = 'ok'; pill = 'Room to spare'; msg = 'All ' + cc + ' concurrent requests fit in KV. At this length up to ' + maxCc + ' can run without a queue.'; }
+        v.className = 'verdict ' + cls; v.children[0].textContent = pill; v.children[1].textContent = msg;
+
+        var total = Math.max(capTot, wTot + OVH * tp + kvNeed);
+        var bars = $('bar').children;
+        var wShow = Math.min(wTot, capTot), oShow = Math.min(OVH * tp, Math.max(capTot - wShow, 0));
+        var kvRoom = Math.max(capTot * util - wShow - oShow, 0);
+        var kvShow = Math.min(kvNeed, kvRoom);
+        var over = Math.max(wTot + OVH * tp + kvNeed - capTot * util, 0);
+        bars[0].style.width = (wShow / total * 100) + '%';
+        bars[1].style.width = (oShow / total * 100) + '%';
+        bars[2].style.width = (kvShow / total * 100) + '%';
+        bars[3].style.width = (over / total * 100) + '%';
+        $('capTxt').textContent = mem + 'GB × ' + tp + ' = ' + capTot + 'GB, usable ' + fmt(capTot * util) + 'GB';
+
+        $('sW').textContent = fmt(wPer);
+        $('sKV').textContent = fmt(kvBudget);
+        $('sTok').textContent = fmt(Math.floor(tokens), 0);
+        $('sMax').textContent = fmt(Math.max(maxCc, 0), 0);
+        $('sTps').textContent = wPer > usable ? '–' : fmt(tps, 0);
+      }
+      ['m', 'q', 'kvq', 'g', 'tp', 'util', 'ctx', 'cc'].forEach(function (id) { $(id).addEventListener('input', run); $(id).addEventListener('change', run); });
+      run();
+    })();
+  </script>
+  <script src="../../../assets/edit.js"></script>
+</body>
+</html>

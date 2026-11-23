@@ -6,7 +6,7 @@
 - `book`: 읽은 책에서 옮겨 둔 인용문. 책 정보와 `.quote` 목록이 전부다. 템플릿 `templates/book-template.html`.
 - `scrap`: 기사, 아티클 링크 공유. 원문 링크 카드(`.source`), 발췌(`.quote`), 짧은 메모. 템플릿 `templates/scrap-template.html`.
 
-Astro 정적 사이트이고 GitHub Pages로 배포한다. 저장소 이름은 `naedevlog` 그대로다.
+Astro 정적 사이트이고 GitHub Pages로 배포한다. 저장소는 `naenae0210/naelog`, 주소는 https://naenae0210.github.io/naelog/ 다. 로컬 폴더 이름은 `naedevlog` 그대로다.
 
 ## 구조
 
@@ -54,7 +54,8 @@ Astro 정적 사이트이고 GitHub Pages로 배포한다. 저장소 이름은 `
 
 ## 글쓰기 규칙
 
-- 반말(다/한다)로 쓴다.
+- dev 글은 존댓말(합니다/입니다)로 쓴다. 다른 사람이 쓴 원고를 옮길 때도 존댓말을 그대로 둔다.
+- 시리즈 글은 `<meta name="post:series" content="시리즈 이름">`과 `<meta name="post:part" content="n">`을 둔다. 목록과 제목 위 작은 줄에 "LLM 서빙 1편"처럼 나온다. 제목에는 번호를 넣지 않고, 위쪽에 `.series`(편 목록), 아래쪽에 `.series-pager`(이전/다음 편)를 둔다. 예: `public/posts/llm-serving-*`.
 - em dash(—)는 쓰지 않는다. 콜론, 쉼표, 하이픈을 쓴다.
 - 제목과 소제목에 번호를 붙이지 않는다.
 - 메모리 단위는 GiB로 통일한다.

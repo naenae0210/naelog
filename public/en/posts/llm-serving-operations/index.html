@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>What Breaks First at 100 Users? Metrics and Concurrent Requests · naelog</title>
+  <meta name="description" content="Part 3 of the LLM serving notes: the GPU utilization trap, TTFT, TPOT and throughput, and how capacity breaks as concurrent requests grow." />
+  <!-- 홈 목록에 쓰이는 정보 -->
+  <meta name="post:log" content="dev" />
+  <meta name="post:date" content="2026-11-23" />
+  <meta name="post:series" content="LLM Serving" />
+  <meta name="post:part" content="3" />
+  <meta name="post:category" content="GPU &amp; Inference" />
+  <meta name="post:tags" content="LLM Serving, vLLM, Latency, Throughput" />
+  <link rel="stylesheet" href="../../../assets/naedevlog.css" />
+  <link rel="alternate" hreflang="ko" href="../../../posts/llm-serving-operations/" />
+  <script src="../../../assets/site.js"></script>
+  <style>
+    /* 설명이 긴 표는 칸 안에서 줄바꿈한다 */
+    .table-wrap td:not(.num) { white-space: normal; min-width: 7em; }
+    .table-wrap th { white-space: nowrap; }
+  </style>
+</head>
+<body>
+  <header class="site-header"><div class="inner">
+    <a class="logo" href="../../">naelog</a>
+    <nav class="nav">
+      <a href="../../dev/" aria-current="page">dev</a>
+      <a href="../../book/">book</a>
+      <a href="../../scrap/">scrap</a>
+    </nav>
+  </div></header>
+
+  <main class="wrap">
+    <div class="category">LLM Serving · Part 3</div>
+    <h1>What Breaks First at 100 Users? Metrics and Concurrent Requests</h1>
+    <p class="lead">Being fast for one user is different from holding up for a hundred. Part 3 covers reading the metrics and designing for concurrent requests.</p>
+    <div class="post-meta">
+      <span>2026.11.23</span><span class="dot"></span><span>10 min</span>
+      <span class="tag">LLM Serving</span><span class="tag">vLLM</span><span class="tag">Latency</span><span class="tag">Throughput</span>
+    </div>
+
+    <nav class="series" aria-label="LLM serving series">
+      <div class="series-label">LLM serving notes · 3 parts</div>
+      <a href="../llm-serving-memory/"><span>Part 1</span>Memory and quantization<small>Why doesn't 70B fit on one A100?</small></a>
+      <a href="../llm-serving-runtime/"><span>Part 2</span>How a model runs on the GPU<small>Why do answers come out one token at a time?</small></a>
+      <a href="../llm-serving-operations/" aria-current="page"><span>Part 3 · reading now</span>Performance and operations<small>What breaks first at 100 users?</small></a>
+    </nav>
+
+    <p><strong>Part 1:</strong> for a model to fit, weights + KV cache + overhead have to fit in GPU memory. The room for KV cache is how many people you can serve at once.</p>
+    <p><strong>Part 2:</strong> answers are produced one character (token) at a time (decode), and every token means reading all the weights, so memory speed is the bottleneck. That is why <strong>batching, putting many requests on one bus</strong>, raises efficiency, and vLLM runs that bus.</p>
+    <p>This part asks <strong>"once people actually start using it, where does it slow down, and how many can it handle?"</strong></p>
+    <ol>
+    <li><strong>Performance metrics</strong>: the GPU utilization trap, response time (TTFT, TPOT, E2E), throughput</li>
+    <li><strong>Handling concurrent requests</strong>: the order things break as users grow, and how to size capacity</li>
+    <li><strong>A case</strong>: going from 10 users to 100</li>
+    </ol>
+    <h2>GPU Utilization, Inference Latency, Throughput</h2>
+    <h3>GPU utilization hides more than you think</h3>
+    <p>GPU-Util 100% in <code>nvidia-smi</code> only means "at least one kernel was running during the sampling window", not that the SMs were full. Lights being on in a factory does not mean every worker is busy. Decode-heavy load often shows 100% Util while using only 20 to 30% of the compute units. The real picture is DCGM's <code>SM Activity</code> and <code>DRAM Activity</code> (bandwidth use). 90% memory usage is not a load metric either; vLLM reserved it up front. Actual KV usage is vLLM's <code>vllm:gpu_cache_usage_perc</code>.</p>
+
+    <h3>Split latency into three</h3>
+    <figure class="figure">
+      <svg viewBox="0 0 700 110" role="img" aria-label="Timing of one request: queue, prefill, decode tokens" font-family="Pretendard Variable, Pretendard, sans-serif">
+        <text x="0" y="31" fill="#4e5968" font-size="13" font-weight="600">Request</text>
+        <g transform="translate(60,14)">
+          <rect x="0" y="0" width="76" height="26" rx="5" fill="#f2f4f6" stroke="#d1d6db"/>
+          <rect x="80" y="0" width="140" height="26" rx="5" fill="#3182f6"/>
+          <g fill="#90c2ff">
+            <rect x="224" y="0" width="38" height="26" rx="4"/><rect x="266" y="0" width="38" height="26" rx="4"/><rect x="308" y="0" width="38" height="26" rx="4"/>
+            <rect x="350" y="0" width="38" height="26" rx="4"/><rect x="392" y="0" width="38" height="26" rx="4"/><rect x="434" y="0" width="38" height="26" rx="4"/>
+            <rect x="476" y="0" width="38" height="26" rx="4"/><rect x="518" y="0" width="38" height="26" rx="4"/><rect x="560" y="0" width="38" height="26" rx="4"/>
+            <rect x="602" y="0" width="38" height="26" rx="4"/>
+          </g>
+          <path d="M0 36 v6 h220 v-6" fill="none" stroke="#b0b8c1" stroke-width="1.5"/>
+          <text x="110" y="58" fill="#4e5968" font-size="12" text-anchor="middle">TTFT</text>
+          <path d="M224 36 v6 h38 v-6" fill="none" stroke="#b0b8c1" stroke-width="1.5"/>
+          <text x="243" y="58" fill="#4e5968" font-size="12" text-anchor="middle">TPOT</text>
+        </g>
+        <g transform="translate(60,92)" font-size="13" fill="#4e5968">
+          <rect x="0" y="0" width="12" height="12" rx="3" fill="#f2f4f6" stroke="#d1d6db"/><text x="20" y="11">Queue</text>
+          <rect x="100" y="0" width="12" height="12" rx="3" fill="#3182f6"/><text x="120" y="11">Prefill</text>
+          <rect x="200" y="0" width="12" height="12" rx="3" fill="#90c2ff"/><text x="220" y="11">Decode tokens</text>
+        </g>
+      </svg>
+    </figure>
+    <div class="table-wrap"><table>
+    <tr><th>Metric</th><th>Meaning</th><th>What users feel</th><th>Main causes of increase</th></tr>
+    <tr><td>TTFT<br><small>Time To First Token</small></td><td>From request to first token (queue + prefill)</td><td>"It is slow to respond"</td><td>Long prompts, queue buildup</td></tr>
+    <tr><td>TPOT / ITL<br><small>Time Per Output Token / Inter-Token Latency</small></td><td>Gap between tokens</td><td>"The text comes out slowly"</td><td>Big batches, big models, slow bandwidth</td></tr>
+    <tr><td>E2E<br><small>End-to-End latency</small></td><td>TTFT + TPOT × (output tokens − 1)</td><td>"Until the whole answer is out"</td><td>Long output</td></tr>
+    </table></div>
+    <div class="callout info">
+    <span class="label">In plain words · As a restaurant</span>
+    <div class="table-wrap"><table>
+    <tr><th>Metric</th><th>Restaurant analogy</th></tr>
+    <tr><td><strong>TTFT</strong></td><td>From ordering to the first dish arriving</td></tr>
+    <tr><td><strong>TPOT / ITL</strong></td><td>The gap between dishes</td></tr>
+    <tr><td><strong>E2E</strong></td><td>Until the whole meal has arrived</td></tr>
+    <tr><td><strong>p95</strong></td><td>How long the 5 longest-waiting diners out of 100 waited</td></tr>
+    </table></div>
+    </div>
+    <p>TPOT and ITL mean almost the same thing: the average gap between tokens is TPOT, and each individual gap is ITL. The three metrics connect like this. With TTFT 0.5s, TPOT 50ms and 200 output tokens, E2E is about <code>0.5 + 0.05 × 199 ≈ 10.5s</code>.</p>
+    <p>People read at roughly 5 to 10 tokens per second, so for streaming chat a common target is TPOT under 100ms and TTFT under 1 to 2 seconds. Here you have to look at p95 and p99 (the 95th and 99th percentiles, the slowest 5% and 1%), not the average, to see the delays some users actually hit. Even with a fine average, a p95 of 10s means 1 in 20 people waits more than 10 seconds.</p>
+
+    <h3>Throughput is traded against latency</h3>
+    <p>Throughput is "tokens the whole GPU generates per second" (output tok/s) or "requests handled per second" (req/s). As concurrency rises, the cost of reading the weights is split across more requests, so total throughput goes up; but each step has more work, so each request's TPOT grows. Like a bus: more passengers means more carried per trip, but each stop takes longer. Past a certain point throughput barely moves and only latency grows, and just before that is the best operating point.</p>
+    <div class="table-wrap"><table>
+    <tr><th>Concurrent requests</th><th>Per-request TPOT</th><th>Total throughput</th><th>State</th></tr>
+    <tr><td class="num">1</td><td>Shortest</td><td>Very low</td><td>The GPU is mostly idle</td></tr>
+    <tr><td class="num">8~32</td><td>Slightly longer</td><td>Rises steeply</td><td>Bandwidth is shared and efficiency goes up</td></tr>
+    <tr><td class="num">64+</td><td>Clearly longer</td><td>Flattens out</td><td>Approaching the compute or KV limit</td></tr>
+    <tr><td>Past the KV limit</td><td>Wait time explodes</td><td>Stops rising</td><td>Queueing and preemption</td></tr>
+    </table></div>
+    <p>This table shows the trend; the exact turning point differs by model, GPU and input/output length. Measure it yourself with <code>vllm bench serve</code> (<code>benchmark_serving.py</code> in older versions) while varying concurrency.</p>
+    <h2>Handling concurrent requests</h2>
+    <p>As users grow, things break in almost the same order every time.</p>
+    <ol>
+    <li><strong>TPOT slowly grows</strong>: bigger batches make each step longer. Still in the normal range</li>
+    <li><strong>The KV cache fills and a queue forms</strong>: <code>vllm:num_requests_waiting</code> goes above 0. New requests wait until KV blocks free up, so TTFT shoots up</li>
+    <li><strong>Preemption</strong>: when running requests run out of KV, vLLM evicts some and later recomputes them from the start. Doing the same work twice drops throughput too. Check <code>vllm:num_preemptions_total</code></li>
+    <li><strong>Timeouts</strong>: past the gateway's (nginx, Cloudflare etc.) wait limit you get 504. Users feel "the server is down"</li>
+    </ol>
+    <h3>Sizing concurrency: Little's law</h3>
+    <div class="formula">Concurrent requests = <b>requests per second</b> × <b>average time per request (s)</b></div>
+    <p>It is the same formula as "people in the shop = people arriving per minute × time each one stays". If 2 requests arrive per second and each answer takes 15 seconds on average, 30 are always running at once. Those 30 × average tokens per request must fit in the KV budget for it to run without a queue.</p>
+    <h3>What to do</h3>
+    <div class="table-wrap"><table>
+    <tr><th>Symptom</th><th>Try first</th></tr>
+    <tr><td>Not enough KV, queueing</td><td>FP8 KV cache, smaller <code>--max-model-len</code>, quantize weights to free KV room, add GPUs (TP or replicas)</td></tr>
+    <tr><td>TTFT up from long RAG prompts</td><td>Prefix caching, fewer retrieved documents or shorter chunks, chunked prefill</td></tr>
+    <tr><td>TPOT up</td><td>Cap the batch with <code>--max-num-seqs</code>, a smaller or quantized model, a GPU with more bandwidth</td></tr>
+    <tr><td>Repeated preemption</td><td>Lower <code>--max-num-seqs</code>, free KV. Preemption is a signal that "taking a bit less is better"</td></tr>
+    <tr><td>Uneven load per user</td><td>Per-user concurrency limits at the gateway, an output token cap (<code>max_tokens</code>)</td></tr>
+    </table></div>
+    <p>TP and replicas serve different purposes. TP is for "a model that does not fit on one card"; if it fits, running several replicas on the same number of GPUs behind a load balancer usually gives better throughput because there is no GPU-to-GPU communication.</p>
+    <h2>Back to a real case</h2>
+    <h3>Going from 10 users to 100</h3>
+    <p>Assume two H100s, 70B FP8, and 4K tokens per request on average. With a KV budget of about 400,000 tokens, 4K requests top out at a little over 100 concurrent.</p>
+    <ol>
+    <li>10 users: small batches, short TPOT, most GPU bandwidth wasted</li>
+    <li>50 users: throughput rises sharply and TPOT grows with it. Still feels fine</li>
+    <li>100 users + long RAG documents: KV limit reached, a queue forms, TTFT jumps from seconds to tens of seconds</li>
+    <li>In that state, if some users attach 32K documents, one request takes the KV of eight 4K requests and preemption starts</li>
+    </ol>
+    <p>So in operations you put four numbers on the dashboard, <code>num_requests_waiting</code>, <code>gpu_cache_usage_perc</code>, <code>num_preemptions_total</code> and TTFT p95, and use "the queue is no longer zero most of the time" as the trigger to scale up.</p>
+
+    <h2 id="glossary">Glossary</h2>
+    <p>Abbreviations used in part 3. GPU terms like SM and DCGM are in the <a href="../llm-serving-runtime/#glossary">part 2</a> glossary, basics like KV cache in the <a href="../llm-serving-memory/#glossary">part 1</a> glossary.</p>
+    <h3>Performance metrics</h3>
+    <div class="table-wrap"><table>
+    <tr><th>Term</th><th>Full name</th><th>Plain meaning</th></tr>
+    <tr><td>TTFT</td><td>Time To First Token</td><td>Time until the first character appears</td></tr>
+    <tr><td>TPOT</td><td>Time Per Output Token</td><td>Average time for each additional character</td></tr>
+    <tr><td>ITL</td><td>Inter-Token Latency</td><td>The gap between characters (individual measurements)</td></tr>
+    <tr><td>E2E</td><td>End-to-End latency</td><td>Total time from request to the end of the answer</td></tr>
+    <tr><td>p95 / p99</td><td>95th / 99th percentile</td><td>The value at the slowest 5% / 1%</td></tr>
+    <tr><td>tok/s</td><td>tokens per second</td><td>Tokens produced per second</td></tr>
+    <tr><td>req/s</td><td>requests per second</td><td>Requests handled per second</td></tr>
+    <tr><td>RAG</td><td>Retrieval-Augmented Generation</td><td>Searching documents and attaching them to the prompt to answer</td></tr>
+    </table></div>
+
+    <p class="caption">Memory and speed figures are approximations calculated from published model architectures and GPU specs. Real values vary with the vLLM version, kernels and input/output length, so confirm them with startup logs and benchmarks.</p>
+
+    <nav class="series-pager" aria-label="Previous and next part">
+      <a href="../llm-serving-runtime/"><span>← Part 2</span>How a model runs on the GPU</a>
+    </nav>
+  </main>
+  <footer class="site-footer">naelog · dev</footer>
+  <script src="../../../assets/edit.js"></script>
+</body>
+</html>

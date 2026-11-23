@@ -20,6 +20,9 @@ const alt = en ? { lang: 'ko', href: `${base}${path}` } : { lang: 'en', href: `$
 // 주제 필터는 dev 목록에서만 쓴다. book, scrap은 저자와 매체가 너무 많아 버튼이 늘어진다.
 const categories = log === 'dev' ? [...new Set(posts.map((p) => p.category))] : [];
 const fmtDate = (d: string) => d.replaceAll('-', '.');
+// 시리즈 글은 주제 대신 "LLM 서빙 1편"처럼 시리즈와 편 번호를 보여 준다
+const label = (p: { series: string; part: number; category: string }) =>
+  p.series && p.part ? (en ? `${p.series} · Part ${p.part}` : `${p.series} ${p.part}편`) : p.category;
 ---
 <!doctype html>
 <html lang={lang}>
@@ -81,7 +84,7 @@ const fmtDate = (d: string) => d.replaceAll('-', '.');
       {posts.map((p) => (
         <li data-cat={p.category}>
           <a href={hrefOf(p)}>
-            <div class="c">{current ? p.category : `${logOf(p.log).name} · ${p.category}`}</div>
+            <div class="c">{current ? label(p) : `${logOf(p.log).name} · ${label(p)}`}</div>
             <div class="t">{p.title}</div>
             <div class="m">
               <span>{fmtDate(p.date)}</span>
