@@ -15,7 +15,7 @@ Astro 정적 사이트이고 GitHub Pages로 배포한다. 저장소 이름은 `
 - `public/assets/naedevlog.css`: 공통 디자인. 모든 글이 이 파일 하나를 쓴다.
 - `src/logs.ts`: 사이트 이름과 로그 목록(id, 이름, 소개 문구). 로그를 늘리거나 고칠 때 여기만 바꾼다.
 - `src/posts.ts`: 빌드할 때 글 폴더를 읽어 목록을 만든다.
-- `src/components/Home.astro`: 글 목록 화면. `src/pages/index.astro`(전체)와 `src/pages/[log].astro`(`/dev/`, `/book/`, `/scrap/`)가 같이 쓴다.
+- `src/components/Home.astro`: 글 목록 화면. 글을 전부 HTML에 넣고 처음 10개만 보여 준다. 스크롤이 목록 끝에 닿으면 10개씩 더 연다(Home.astro 안 script의 `STEP`). `src/pages/index.astro`(전체)와 `src/pages/[log].astro`(`/dev/`, `/book/`, `/scrap/`)가 같이 쓴다.
 - `public/assets/site.js`: 다크/라이트 토글, 한국어/영어 링크. 모든 페이지가 `<head>`에서 부른다.
 - `public/en/posts/<slug>/index.html`: dev 글의 영어판. 영어 목록은 `/en/`, `/en/dev/`, `/en/book/`, `/en/scrap/` 모두 있다. book, scrap 영어 목록은 문구만 영어이고 한국어 글로 연결한다.
 - `public/assets/edit.js`, `astro.config.mjs`의 `postEditor`: 로컬 글 편집기. 본문과 태그를 고친다.
@@ -26,6 +26,7 @@ Astro 정적 사이트이고 GitHub Pages로 배포한다. 저장소 이름은 `
 2. `<head>`의 `post:*` 메타를 채운다.
    - `post:log`: `dev`, `book`, `scrap` 중 하나. 없으면 `dev`로 본다. 템플릿에 이미 맞춰져 있다(헤더 nav의 `aria-current`, 푸터 `naelog · <로그>`).
    - `post:category`: dev는 주제(GPU와 추론, 모니터링, 인프라와 배포, RAG와 데이터), book은 저자, scrap은 매체. 기존 글과 같은 표기를 쓴다.
+   - `post:tags`: 쉼표로 나눈다. 태그 안에 쉼표가 있으면 `\,`로 쓴다 (예: `Peau noire\, masques blancs`).
    - `post:date`: YYYY-MM-DD. 이 날짜 순으로 홈에 정렬된다.
    - 아직 공개하지 않을 글은 `post:draft`를 `true`로 둔다.
 3. 본문을 쓰고 필요 없는 컴포넌트는 지운다.

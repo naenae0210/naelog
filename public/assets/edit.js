@@ -13,6 +13,9 @@
 
   fetch(api('ping')).then((r) => (r.ok ? r.json() : null)).then((j) => j && j.ok && init()).catch(() => {});
 
+  // 태그는 쉼표로 나눈다. 태그 안의 쉼표는 \, 로 쓴다
+  const splitTags = (s) => s.split(/(?<!\\),/).map((t) => t.replace(/\\,/g, ',').trim()).filter(Boolean);
+
   function init() {
     const css = document.createElement('style');
     css.textContent = `
@@ -79,12 +82,12 @@
       tagInput = null;
       if (meta) {
         const tm = doc.querySelector('meta[name="post:tags"]');
-        const tags = tm ? tm.content.split(',') : [...meta.querySelectorAll('.tag')].map((t) => t.textContent);
+        const tags = tm ? splitTags(tm.content) : [...meta.querySelectorAll('.tag')].map((t) => t.textContent);
         meta.querySelectorAll('.tag').forEach((t) => t.remove());
         tagInput = document.createElement('input');
         tagInput.className = 'nd-tags';
         tagInput.placeholder = '태그, 쉼표로 구분';
-        tagInput.value = tags.map((t) => t.trim()).filter(Boolean).join(', ');
+        tagInput.value = tags.map((t) => t.trim().replace(/,/g, '\\,')).filter(Boolean).join(', ');
         meta.appendChild(tagInput);
       }
       document.execCommand('defaultParagraphSeparator', false, 'p');
@@ -115,7 +118,7 @@
       location.reload();
     }
 
-    const readTags = () => tagInput ? tagInput.value.split(',').map((t) => t.trim()).filter(Boolean) : null;
+    const readTags = () => tagInput ? splitTags(tagInput.value) : null;
 
     function clean(root) {
       const c = root.cloneNode(true);

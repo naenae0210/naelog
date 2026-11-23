@@ -9,7 +9,7 @@
   <meta name="post:log" content="book" />
   <meta name="post:date" content="{{YYYY-MM-DD}}" />
   <meta name="post:category" content="{{저자}}" />
-  <meta name="post:tags" content="{{장르}}" />
+  <meta name="post:tags" content="{{장르}}, {{원제}}" />
   <!-- <meta name="post:draft" content="true" />  홈에서 숨기려면 주석 해제 -->
   <link rel="stylesheet" href="../../assets/naedevlog.css" />
   <script src="../../assets/site.js"></script>
@@ -27,10 +27,10 @@
   <main class="wrap">
     <div class="category">{{저자}}</div>
     <h1>{{책 제목}}</h1>
-    <p class="lead">{{저자}}, 『{{책 제목}}』({{원제}})</p>
+    <p class="lead">『{{원제}}』</p>  <!-- 원제가 없는 한국 책이면 이 줄을 지운다 -->
     <div class="post-meta">
       <span>{{YYYY.MM.DD}}</span>
-      <span class="tag">{{장르}}</span>
+      <span class="tag">{{장르}}</span><span class="tag">{{원제}}</span>
     </div>
 
     <div class="quotes">

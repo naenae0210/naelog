@@ -1,7 +1,8 @@
 ---
 // 홈(전체 글)과 로그별 목록이 같이 쓰는 화면. log 를 넘기면 그 로그의 글만 보인다.
 // lang="en" 이면 영어판 목록(/en/, /en/<log>/)이다.
-import { getPosts } from '../posts';
+// 글은 전부 HTML에 넣고, 화면에는 10개씩 보여 준다. 바닥까지 스크롤하면 10개를 더 연다(아래 script).
+import { listPosts } from '../posts';
 import { LOGS, SITE, SITE_EN, logOf } from '../logs';
 interface Props { log?: string; lang?: 'ko' | 'en' }
 const { log, lang = 'ko' } = Astro.props;
@@ -9,18 +10,15 @@ const en = lang === 'en';
 const current = log ? logOf(log) : null;
 const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
 const home = en ? `${base}en/` : base;
-// 영어 목록: 영어판이 있는 로그(dev)는 영어 글, 나머지는 한국어 글을 보여 준다.
-const all = en
-  ? [...getPosts('en'), ...getPosts('ko').filter((p) => !logOf(p.log).enPosts)].sort((a, b) => b.date.localeCompare(a.date))
-  : getPosts();
-const posts = all.filter((p) => !log || p.log === log);
+const posts = listPosts(lang, log);
 const hrefOf = (p: { lang: string; slug: string }) => `${base}${p.lang === 'en' ? 'en/' : ''}posts/${p.slug}/`;
 const info = en ? (current?.en ?? SITE_EN) : (current ?? SITE);
 const nav = LOGS.map((l) => ({ href: `${home}${l.id}/`, name: l.name, current: l.id === log }));
 // 같은 목록의 다른 언어판
 const path = log ? `${log}/` : '';
 const alt = en ? { lang: 'ko', href: `${base}${path}` } : { lang: 'en', href: `${base}en/${path}` };
-const categories = [...new Set(posts.map((p) => p.category))];
+// 주제 필터는 dev 목록에서만 쓴다. book, scrap은 저자와 매체가 너무 많아 버튼이 늘어진다.
+const categories = log === 'dev' ? [...new Set(posts.map((p) => p.category))] : [];
 const fmtDate = (d: string) => d.replaceAll('-', '.');
 ---
 <!doctype html>
@@ -53,6 +51,7 @@ const fmtDate = (d: string) => d.replaceAll('-', '.');
     .m { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; font-size: 14px; color: var(--faint); }
     .m .tag { font-size: 12px; padding: 1px 8px; }
     .empty { color: var(--faint); padding: 48px 0; text-align: center; }
+    .more { height: 1px; }
     [hidden] { display: none !important; }
     @media (max-width: 600px) { .t { font-size: 19px; } .list a { padding: 22px 0; } }
   </style>
@@ -92,22 +91,41 @@ const fmtDate = (d: string) => d.replaceAll('-', '.');
         </li>
       ))}
     </ul>
+    <div class="more" aria-hidden="true"></div>
     <p class="empty" hidden>{en ? 'No posts yet.' : '아직 글이 없다.'}</p>
   </main>
   <footer class="site-footer">{SITE.name} · {info.intro || info.heading}</footer>
 
   <script>
+    // 처음 STEP개만 보여 주고, 목록 끝(.more)이 화면에 들어오면 STEP개씩 더 연다.
+    // 펼친 개수는 세션에 남겨서, 글을 보고 뒤로 왔을 때 같은 만큼 다시 펼친다.
+    const STEP = 10;
+    const KEY = 'naelog-shown:' + location.pathname;
+    const items = [...document.querySelectorAll<HTMLElement>('.list li')];
+    const more = document.querySelector<HTMLElement>('.more')!;
     let cat = 'all';
+    let limit = STEP;
+    try { limit = Math.max(STEP, Number(sessionStorage.getItem(KEY)) || STEP); } catch (e) {}
+
+    let matched = 0;
     const apply = () => {
-      let n = 0;
-      document.querySelectorAll<HTMLElement>('.list li').forEach((li) => {
-        const show = cat === 'all' || li.dataset.cat === cat;
-        li.hidden = !show; if (show) n++;
+      matched = 0;
+      items.forEach((li) => {
+        const match = cat === 'all' || li.dataset.cat === cat;
+        li.hidden = !match || matched >= limit;
+        if (match) matched++;
       });
-      document.querySelector<HTMLElement>('.empty')!.hidden = n > 0;
+      document.querySelector<HTMLElement>('.empty')!.hidden = matched > 0;
+      more.hidden = matched <= limit;
+      try { sessionStorage.setItem(KEY, String(limit)); } catch (e) {}
     };
+
+    new IntersectionObserver((entries) => {
+      if (entries.some((e) => e.isIntersecting) && matched > limit) { limit += STEP; apply(); }
+    }, { rootMargin: '400px 0px' }).observe(more);
+
     document.querySelectorAll<HTMLButtonElement>('.cat').forEach((b, _, all) => b.addEventListener('click', () => {
-      all.forEach((x) => x.setAttribute('aria-pressed', String(x === b))); cat = b.dataset.cat!; apply();
+      all.forEach((x) => x.setAttribute('aria-pressed', String(x === b))); cat = b.dataset.cat!; limit = STEP; apply();
     }));
     apply();
   </script>

@@ -66,7 +66,7 @@ function postEditor() {
               let out = src.replace(MAIN_RE, (_, a, __, c) => a + main.replace(/\s+$/, '') + c);
               if (title) out = out.replace(/<title>[^<]*<\/title>/, `<title>${title} · naelog</title>`);
               if (Array.isArray(tags)) {
-                const esc = (t) => String(t).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                const esc = (t) => String(t).replace(/,/g, '\\,').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
                 const tm = `<meta name="post:tags" content="${tags.map(esc).join(', ')}" />`;
                 out = /<meta name="post:tags"[^>]*>/.test(out)
                   ? out.replace(/<meta name="post:tags"[^>]*>/, tm)
