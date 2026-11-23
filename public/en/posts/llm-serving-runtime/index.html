@@ -152,6 +152,46 @@
     <tr><td><code>CUDA out of memory</code></td><td>⑤ GPU memory</td><td>The desk is full. Start again from the memory math in part 1</td></tr>
     </table></div>
 
+    <h2>What the inside of a GPU looks like</h2>
+    <p>Earlier we called the GPU "a factory with thousands of workers". To understand why inference runs at the speed it does, you need to know where this factory computes and where it keeps its materials. Take the H100 SXM as the example.</p>
+    <figure class="figure">
+      <svg viewBox="0 0 700 300" role="img" aria-label="The H100's SM, L2 cache and HBM hierarchy with the size and speed of each" font-family="Pretendard Variable, Pretendard, sans-serif">
+        <g font-size="12" fill="#4e5968">
+          <rect x="0" y="0" width="420" height="110" rx="12" fill="#fff" stroke="#e5e8eb"/>
+          <text x="16" y="24" font-size="14" font-weight="700" fill="#191f28">SM × 132</text>
+          <g transform="translate(16,38)">
+            <rect x="0" y="0" width="118" height="56" rx="8" fill="#f2f4f6" stroke="#d1d6db"/><text x="59" y="24" text-anchor="middle" font-weight="700" fill="#191f28">Tensor cores</text><text x="59" y="42" text-anchor="middle">matrix multiply</text>
+            <rect x="128" y="0" width="118" height="56" rx="8" fill="#f2f4f6" stroke="#d1d6db"/><text x="187" y="24" text-anchor="middle" font-weight="700" fill="#191f28">CUDA cores</text><text x="187" y="42" text-anchor="middle">general compute</text>
+            <rect x="256" y="0" width="132" height="56" rx="8" fill="#f2f4f6" stroke="#d1d6db"/><text x="322" y="24" text-anchor="middle" font-weight="700" fill="#191f28">Registers, SRAM</text><text x="322" y="42" text-anchor="middle">hundreds of KB per SM</text>
+          </g>
+          <rect x="0" y="130" width="420" height="50" rx="12" fill="#fff" stroke="#e5e8eb"/>
+          <text x="16" y="160" font-size="14" font-weight="700" fill="#191f28">L2 cache</text><text x="110" y="160">shared by all SMs · 50MB</text>
+          <rect x="0" y="200" width="420" height="56" rx="12" fill="#3182f6"/>
+          <text x="16" y="226" font-size="14" font-weight="700" fill="#fff">HBM</text><text x="110" y="226" fill="#fff">80GB · where weights and KV cache live</text>
+          <text x="110" y="244" fill="#fff">about 3.35TB per second</text>
+          <path d="M210 110 v20 M210 180 v20" stroke="#b0b8c1" stroke-width="1.5"/>
+        </g>
+        <g font-size="12" fill="#4e5968">
+          <text x="450" y="30" font-weight="700" fill="#191f28">Further down</text>
+          <text x="450" y="50">means bigger and slower</text>
+          <text x="450" y="100" font-weight="700" fill="#191f28">Compute</text>
+          <text x="450" y="120">about 990 trillion BF16 ops per second</text>
+          <text x="450" y="170" font-weight="700" fill="#191f28">Reading from HBM</text>
+          <text x="450" y="190">about 3.35 trillion bytes per second</text>
+          <text x="450" y="240" font-weight="700" fill="#191f28">The gap</text>
+          <text x="450" y="260">about 300 ops per byte read</text>
+        </g>
+        <text x="0" y="290" font-size="11" fill="#8b95a1">Approximations from public H100 SXM specs. Compute is dense BF16 without sparsity.</text>
+      </svg>
+    </figure>
+    <ul>
+    <li><strong>SM (Streaming Multiprocessor)</strong>: the compute block inside a GPU. The H100 has 132. Each SM holds <strong>tensor cores</strong> dedicated to matrix multiplication, CUDA cores for general compute, and very fast but small registers and shared memory (SRAM).</li>
+    <li><strong>L2 cache</strong>: a middle store shared by all SMs. At 50MB it is tiny next to the 140GB of 70B weights.</li>
+    <li><strong>HBM</strong>: where the weights and KV cache from part 1 actually live. Large, but much farther away than the memory inside an SM.</li>
+    </ul>
+    <p>The numbers on the right are the key. An H100 can multiply and add about 990 trillion times per second, but read only about 3.35 trillion bytes per second from HBM. In other words, <strong>it can compute about 300 times in the time it takes to fetch one byte.</strong> Any work that does not compute more than 300 times per byte read leaves the compute units idle, waiting on memory, however fast they are. The difference between prefill and decode in the next section comes exactly from this.</p>
+    <p>FlashAttention makes sense in this picture too. Computed naively, attention writes an intermediate result (a score table of tokens × tokens) to HBM and reads it back. FlashAttention splits the computation into small tiles and finishes them inside the SM's SRAM, writing only the result to HBM. The computation is the same, but cutting the slow HBM round trips makes it faster and uses less memory at long context.</p>
+
     <h2>Model loading and inference</h2>
     <p>One request goes through two stages with completely different characters: "read it all at once" (prefill) and "write one token at a time" (decode).</p>
     <h3>Loading</h3>
@@ -172,6 +212,33 @@
     <tr><td>What users feel</td><td>"It is slow to respond"</td><td>"The text comes out slowly"</td></tr>
     <tr><td>Grows with</td><td>Long prompts, lots of RAG documents attached</td><td>Long answers, big models, big batches</td></tr>
     </table></div>
+    <h3>Seen through arithmetic intensity</h3>
+    <p>Whether a task is bound by compute or by memory is judged by its <strong>arithmetic intensity</strong>: how many operations it does per byte read from memory. The H100 baseline from the previous section is about 300.</p>
+    <ul>
+    <li><strong>Decode, 1 request</strong>: making one token reads all the weights once and does one multiply-add per weight. Reading a 2-byte BF16 weight for 2 operations gives an intensity of about 1. Far below the baseline of 300, so the compute units spend over 99% of the time waiting on memory.</li>
+    <li><strong>Decode, 64 requests in one batch</strong>: the same weights are read once and used for all 64 requests. Intensity rises to about 64, and efficiency improves by that much. This is how batching works.</li>
+    <li><strong>Prefill, a 2,000-token prompt</strong>: the weights are read once and used for 2,000 tokens at once. Intensity is well past the baseline, and now compute is busy while memory has room to spare.</li>
+    </ul>
+    <figure class="figure">
+      <svg viewBox="0 0 700 260" role="img" aria-label="Roofline diagram showing memory-bound and compute-bound regions by arithmetic intensity" font-family="Pretendard Variable, Pretendard, sans-serif">
+        <g stroke="#d1d6db" stroke-width="1.5" fill="none"><path d="M60 20 v190 h580"/></g>
+        <path d="M60 196 L455 46 L620 46" fill="none" stroke="#4e5968" stroke-width="2.5"/>
+        <path d="M455 46 v164" stroke="#b0b8c1" stroke-width="1.5" stroke-dasharray="4 4"/>
+        <g font-size="12" fill="#4e5968">
+          <text x="56" y="228" text-anchor="middle">1</text><text x="220" y="228" text-anchor="middle">10</text><text x="380" y="228" text-anchor="middle">100</text><text x="540" y="228" text-anchor="middle">1,000</text>
+          <text x="340" y="250" text-anchor="middle">Arithmetic intensity (ops per byte, log scale)</text>
+          <text x="40" y="30" text-anchor="end">fast</text><text x="40" y="206" text-anchor="end">slow</text>
+          <text x="200" y="110" fill="#191f28" font-weight="700">Memory-bound</text><text x="200" y="128">only bandwidth × intensity fast</text>
+          <text x="480" y="34" fill="#191f28" font-weight="700">Compute-bound</text>
+          <text x="462" y="200">baseline about 300</text>
+        </g>
+        <circle cx="60" cy="196" r="7" fill="#3182f6"/><text x="74" y="184" font-size="12" font-weight="700" fill="#3182f6">decode, 1 request</text>
+        <circle cx="349" cy="87" r="6" fill="#b0b8c1"/><text x="300" y="74" font-size="12" fill="#4e5968">decode, 64 requests</text>
+        <circle cx="590" cy="46" r="6" fill="#b0b8c1"/><text x="560" y="74" font-size="12" fill="#4e5968">prefill 2K</text>
+      </svg>
+      <figcaption>Work on the left slope gets faster with faster memory; work on the flat right gets faster with faster compute. A conceptual diagram drawn from H100 specs.</figcaption>
+    </figure>
+    <p>This one picture ties the three parts together. Part 1's quantization cuts the bytes to read and speeds up decode on the slope, batching moves the point to the right, and <a href="../llm-serving-operations/">part 3</a>'s "throughput rises then flattens as concurrency grows" is the point reaching the baseline. Strictly speaking, attention has to read each request's own KV cache separately, so that part's intensity does not rise with batch size. That is why batching helps less when there are many long-context requests.</p>
     <p>Decode is bound by memory bandwidth because every character means skimming the whole encyclopedia (weights) once. At batch size 1, making one token means reading all the weights from HBM once. Running 70B BF16 (140GB) on two H100s (6.7TB/s combined) gives a theoretical ceiling of about 48 tok/s. Make the encyclopedia half as thick with quantization and the ceiling nearly doubles.</p>
     <p>And when several requests share one skim of the weights, the bandwidth cost is split among them. It is like putting many passengers on one bus, and it is how batching raises throughput.</p>
 
@@ -183,6 +250,58 @@
     <li><strong>Prefix caching</strong>: requests that start with the same system prompt or the same RAG documents build that part of the KV once and share it</li>
     <li><strong>Chunked prefill</strong>: splits a long prompt's prefill into chunks and slots them between decode steps, so one long request does not freeze other users' token generation</li>
     </ul>
+    <p>The first two are easiest to understand as pictures. First, PagedAttention.</p>
+    <figure class="figure">
+      <svg viewBox="0 0 700 270" role="img" aria-label="Reserving maximum length per request compared with PagedAttention handing out 16-token blocks" font-family="Pretendard Variable, Pretendard, sans-serif">
+        <g font-size="13" fill="#4e5968">
+          <text x="0" y="16" font-weight="700" fill="#191f28">Before: reserve the full maximum length per request</text>
+          <text x="0" y="46">Request A</text><rect x="70" y="30" width="140" height="24" rx="4" fill="#90c2ff"/><rect x="210" y="30" width="420" height="24" rx="4" fill="#f2f4f6" stroke="#d1d6db" stroke-dasharray="4 3"/>
+          <text x="0" y="78">Request B</text><rect x="70" y="62" width="60" height="24" rx="4" fill="#90c2ff"/><rect x="130" y="62" width="500" height="24" rx="4" fill="#f2f4f6" stroke="#d1d6db" stroke-dasharray="4 3"/>
+          <text x="420" y="110" font-size="12" fill="#8b95a1">Dashed = reserved but unused</text>
+          <text x="0" y="146" font-weight="700" fill="#191f28">PagedAttention: one 16-token block at a time, as needed</text>
+        </g>
+        <g transform="translate(70,160)" font-size="12" text-anchor="middle">
+          <g fill="#3182f6"><rect x="0" width="56" height="30" rx="5"/><rect x="124" width="56" height="30" rx="5"/><rect x="248" width="56" height="30" rx="5"/></g>
+          <g fill="#fff" font-weight="700"><text x="28" y="20">A1</text><text x="152" y="20">A2</text><text x="276" y="20">A3</text></g>
+          <g fill="#90c2ff"><rect x="62" width="56" height="30" rx="5"/><rect x="186" width="56" height="30" rx="5"/></g>
+          <g fill="#191f28"><text x="90" y="20">B1</text><text x="214" y="20">B2</text></g>
+          <g fill="#fff" stroke="#e5e8eb"><rect x="310" width="56" height="30" rx="5"/><rect x="372" width="56" height="30" rx="5"/><rect x="434" width="56" height="30" rx="5"/><rect x="496" width="56" height="30" rx="5"/></g>
+          <g fill="#8b95a1"><text x="338" y="20">free</text><text x="400" y="20">free</text><text x="462" y="20">free</text><text x="524" y="20">free</text></g>
+        </g>
+        <g font-size="12" fill="#4e5968">
+          <text x="0" y="222">Each request remembers where its blocks are in a "block table", so the blocks can be scattered.</text>
+          <text x="0" y="244">The only waste is up to 15 tokens in each request's last block, and free blocks go straight to new requests.</text>
+        </g>
+      </svg>
+    </figure>
+    <p>Next, continuous batching. Compare how a GPU's 4 batch slots are used over the same stretch of time.</p>
+    <figure class="figure">
+      <svg viewBox="0 0 700 270" role="img" aria-label="Waiting for the whole batch to finish compared with continuous batching filling slots every step" font-family="Pretendard Variable, Pretendard, sans-serif">
+        <g font-size="13" fill="#4e5968">
+          <text x="0" y="16" font-weight="700" fill="#191f28">Static batching: the next batch waits for the longest request</text>
+          <g transform="translate(0,28)">
+            <rect x="0" y="0" width="600" height="22" rx="4" fill="#90c2ff"/><text x="10" y="16" fill="#191f28">A (long answer)</text>
+            <rect x="0" y="26" width="180" height="22" rx="4" fill="#90c2ff"/><text x="10" y="42" fill="#191f28">B</text><rect x="180" y="26" width="420" height="22" rx="4" fill="#f2f4f6" stroke="#d1d6db" stroke-dasharray="4 3"/>
+            <rect x="0" y="52" width="260" height="22" rx="4" fill="#90c2ff"/><text x="10" y="68" fill="#191f28">C</text><rect x="260" y="52" width="340" height="22" rx="4" fill="#f2f4f6" stroke="#d1d6db" stroke-dasharray="4 3"/>
+            <rect x="0" y="78" width="120" height="22" rx="4" fill="#90c2ff"/><text x="10" y="94" fill="#191f28">D</text><rect x="120" y="78" width="480" height="22" rx="4" fill="#f2f4f6" stroke="#d1d6db" stroke-dasharray="4 3"/>
+            <text x="610" y="58" font-size="12" fill="#8b95a1">E, F, G</text><text x="610" y="74" font-size="12" fill="#8b95a1">wait outside</text>
+          </g>
+          <text x="0" y="158" font-weight="700" fill="#191f28">Continuous batching: the next request takes a freed slot right away</text>
+          <g transform="translate(0,170)">
+            <rect x="0" y="0" width="600" height="22" rx="4" fill="#90c2ff"/><text x="10" y="16" fill="#191f28">A (long answer)</text>
+            <rect x="0" y="26" width="180" height="22" rx="4" fill="#90c2ff"/><text x="10" y="42" fill="#191f28">B</text><rect x="184" y="26" width="416" height="22" rx="4" fill="#3182f6"/><text x="194" y="42" fill="#fff">E</text>
+            <rect x="0" y="52" width="260" height="22" rx="4" fill="#90c2ff"/><text x="10" y="68" fill="#191f28">C</text><rect x="264" y="52" width="336" height="22" rx="4" fill="#3182f6"/><text x="274" y="68" fill="#fff">F</text>
+            <rect x="0" y="78" width="120" height="22" rx="4" fill="#90c2ff"/><text x="10" y="94" fill="#191f28">D</text><rect x="124" y="78" width="476" height="22" rx="4" fill="#3182f6"/><text x="134" y="94" fill="#fff">G</text>
+          </g>
+        </g>
+      </svg>
+      <figcaption>Time runs left to right. The dashed slots disappear, so the same GPU handles more requests.</figcaption>
+    </figure>
+
+    <h3>How tensor parallel splits a model</h3>
+    <p>70B BF16 (140GB) does not fit on one GPU, so it has to be split across several. Tensor parallel cuts each layer's large matrices vertically or horizontally and gives each GPU one slice. With 2 GPUs, for example, each computes half of the matrix multiply at the same time, and their partial results are added together. That combining step (all-reduce) is handled by NCCL and happens twice per layer, after attention and after the feed-forward block. With 80 layers that is 160 times per token.</p>
+    <p>So the path between GPUs matters. NVLink between H100s moves hundreds of GB per second, while cards connected only over PCIe are close to ten times slower, and communication eats into compute time. That is why "two H100s" can perform very differently under TP depending on whether they have NVLink. If the model fits on one card, it is better not to split it, which leads to part 3's "TP versus replicas".</p>
+
     <h3>How the settings connect to the memory math</h3>
     <pre><code># 70B on two H100s, FP8 weights + FP8 KV
     vllm serve meta-llama/Llama-3.1-70B-Instruct \

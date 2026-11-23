@@ -112,6 +112,40 @@
     <p>즉 새 토큰을 하나 만들 때마다 <strong>앞 토큰들의 Key와 Value가 전부 필요</strong>합니다. 매번 다시 계산하면 낭비이므로, Transformer는 이미 처리한 토큰의 Key·Value를 레이어마다 저장해 두고 재사용합니다. 이 저장 공간이 <strong>KV cache</strong>, 위 비유의 대화 메모장입니다. 80개 층이 각자 따로 Key·Value를 만들기 때문에 아래 식에 레이어 수가 곱해집니다. 그리고 대화가 길수록 메모장이 두꺼워지고 사용자가 많을수록 메모장 개수가 늘어나서, 전체 크기는 길이와 사용자 수에 비례해 커집니다.</p>
     <div class="formula">토큰당 KV = 2(K,V) × <b>레이어 수</b> × <b>KV 헤드 수</b> × <b>헤드 차원</b> × <b>바이트</b></div>
     <p>Llama 3.1 70B(80 레이어, KV 헤드 8개, 헤드 차원 128, BF16)를 넣으면 토큰당 <code>2×80×8×128×2 = 327,680 B</code>, 약 0.33MB입니다.</p>
+    <figure class="figure">
+      <svg viewBox="0 0 700 250" role="img" aria-label="레이어마다 토큰별 K와 V가 쌓이는 KV cache" font-family="Pretendard Variable, Pretendard, sans-serif">
+        <g font-size="12" fill="#4e5968">
+          <text x="0" y="16" font-size="13" font-weight="700" fill="#191f28">토큰 →</text>
+          <text x="90" y="16">철수는</text><text x="170" y="16">사과를</text><text x="250" y="16">샀다</text><text x="330" y="16">.</text><text x="410" y="16">그는</text>
+          <text x="490" y="16" font-weight="700" fill="#3182f6">새 토큰</text>
+          <text x="0" y="52">층 1</text><text x="0" y="96">층 2</text><text x="0" y="140">층 3</text><text x="0" y="176">⋮</text><text x="0" y="214">층 80</text>
+        </g>
+        <g fill="#fff" stroke="#e5e8eb">
+          <rect x="80" y="32" width="70" height="30" rx="6"/><rect x="160" y="32" width="70" height="30" rx="6"/><rect x="240" y="32" width="70" height="30" rx="6"/><rect x="320" y="32" width="70" height="30" rx="6"/><rect x="400" y="32" width="70" height="30" rx="6"/>
+          <rect x="80" y="76" width="70" height="30" rx="6"/><rect x="160" y="76" width="70" height="30" rx="6"/><rect x="240" y="76" width="70" height="30" rx="6"/><rect x="320" y="76" width="70" height="30" rx="6"/><rect x="400" y="76" width="70" height="30" rx="6"/>
+          <rect x="80" y="120" width="70" height="30" rx="6"/><rect x="160" y="120" width="70" height="30" rx="6"/><rect x="240" y="120" width="70" height="30" rx="6"/><rect x="320" y="120" width="70" height="30" rx="6"/><rect x="400" y="120" width="70" height="30" rx="6"/>
+          <rect x="80" y="194" width="70" height="30" rx="6"/><rect x="160" y="194" width="70" height="30" rx="6"/><rect x="240" y="194" width="70" height="30" rx="6"/><rect x="320" y="194" width="70" height="30" rx="6"/><rect x="400" y="194" width="70" height="30" rx="6"/>
+        </g>
+        <g fill="#3182f6">
+          <rect x="480" y="32" width="70" height="30" rx="6"/><rect x="480" y="76" width="70" height="30" rx="6"/><rect x="480" y="120" width="70" height="30" rx="6"/><rect x="480" y="194" width="70" height="30" rx="6"/>
+        </g>
+        <g font-size="12" text-anchor="middle" fill="#4e5968">
+          <text x="115" y="52">K V</text><text x="195" y="52">K V</text><text x="275" y="52">K V</text><text x="355" y="52">K V</text><text x="435" y="52">K V</text>
+          <text x="115" y="96">K V</text><text x="195" y="96">K V</text><text x="275" y="96">K V</text><text x="355" y="96">K V</text><text x="435" y="96">K V</text>
+          <text x="115" y="140">K V</text><text x="195" y="140">K V</text><text x="275" y="140">K V</text><text x="355" y="140">K V</text><text x="435" y="140">K V</text>
+          <text x="115" y="214">K V</text><text x="195" y="214">K V</text><text x="275" y="214">K V</text><text x="355" y="214">K V</text><text x="435" y="214">K V</text>
+          <g fill="#fff" font-weight="700"><text x="515" y="52">K V</text><text x="515" y="96">K V</text><text x="515" y="140">K V</text><text x="515" y="214">K V</text></g>
+        </g>
+        <g font-size="12" fill="#4e5968">
+          <text x="570" y="96">토큰 하나가 들어올 때마다</text>
+          <text x="570" y="116">80개 층 모두에</text>
+          <text x="570" y="136">K, V가 한 칸씩 늘어납니다</text>
+        </g>
+      </svg>
+      <figcaption>KV cache는 "층 수 × 토큰 수" 크기의 표입니다. 표 하나가 요청 하나이고, 동시 요청 수만큼 표가 생깁니다.</figcaption>
+    </figure>
+    <p>위 식의 "KV 헤드 수"에는 설명이 하나 필요합니다. Llama 3.1 70B는 attention 헤드가 64개인데, KV 헤드는 8개뿐입니다. 요즘 모델 대부분이 쓰는 <strong>GQA(Grouped Query Attention)</strong> 때문입니다. Query 헤드 8개가 한 묶음이 되어 Key·Value 헤드 하나를 같이 쓰도록 설계해서, 품질은 거의 그대로 두고 KV cache를 1/8로 줄였습니다. 저장해야 하는 건 Query가 아니라 Key·Value이므로, 계산에는 KV 헤드 수가 들어갑니다.</p>
+    <div class="callout warn-box"><span class="label">자주 하는 실수</span><p>KV 헤드 자리에 <code>num_attention_heads</code>(70B는 64)를 넣으면 KV cache가 8배 크게 나옵니다. 반드시 <code>num_key_value_heads</code>를 넣습니다. 반대로 GQA를 쓰지 않는 옛 모델은 두 값이 같아서, 같은 크기라도 KV cache가 훨씬 큽니다.</p></div>
     <div class="table-wrap"><table>
     <tr><th>70B, BF16 KV</th><th>요청 1개</th><th>동시 16개</th><th>동시 64개</th></tr>
     <tr><td>컨텍스트 4K</td><td class="num">1.3 GB</td><td class="num">21 GB</td><td class="num">86 GB</td></tr>
@@ -119,6 +153,19 @@
     <tr><td>컨텍스트 32K</td><td class="num">10.7 GB</td><td class="num">172 GB</td><td class="num">687 GB</td></tr>
     </table></div>
     <p>8K 대화 하나는 2.7GB지만 64명이 동시에 쓰면 172GB가 됩니다. 가중치가 겨우 들어가도 메모장 놓을 자리가 없으면 서비스가 되지 않습니다. 반대로 KV를 충분히 확보하는 것이 곧 동시 처리량입니다.</p>
+    <figure class="figure">
+      <svg viewBox="0 0 700 220" role="img" aria-label="70B BF16 KV cache가 8K 토큰 기준 동시 요청 수에 따라 커지는 크기와 80GB 카드 용량 비교" font-family="Pretendard Variable, Pretendard, sans-serif">
+        <text x="0" y="16" fill="#4e5968" font-size="13" font-weight="600">70B, BF16 KV, 요청당 8K 토큰 · 막대 길이 700px = 180GB</text>
+        <g font-size="13" fill="#4e5968">
+          <text x="0" y="58">1명</text><rect x="60" y="42" width="11" height="24" rx="4" fill="#90c2ff"/><text x="80" y="59">2.7GB</text>
+          <text x="0" y="102">16명</text><rect x="60" y="86" width="167" height="24" rx="4" fill="#90c2ff"/><text x="236" y="103">43GB</text>
+          <text x="0" y="146">64명</text><rect x="60" y="130" width="600" height="24" rx="4" fill="#3182f6"/><text x="606" y="147" fill="#fff" font-weight="700">172GB</text>
+        </g>
+        <path d="M371 32 v134" stroke="#8b95a1" stroke-width="1.5" stroke-dasharray="4 4"/>
+        <text x="378" y="186" font-size="12" fill="#4e5968">GPU 한 장 전체 80GB</text>
+        <text x="0" y="210" font-size="12" fill="#8b95a1">가중치를 빼기 전인데도, 64명분 KV만으로 80GB 카드 두 장을 넘깁니다.</text>
+      </svg>
+    </figure>
 
     <h3>오버헤드: 잊기 쉬운 2~4GB</h3>
     <ul>
@@ -155,6 +202,22 @@
       <figcaption>가중치와 오버헤드를 빼고 남은 자리가 KV cache, 곧 동시에 받을 수 있는 사람 수입니다.</figcaption>
     </figure>
 
+    <h3>숫자를 어디서 찾고, 어떻게 확인하나</h3>
+    <p>위 계산에 필요한 값은 Hugging Face 모델 저장소의 <code>config.json</code>에 다 있습니다. Llama 3.1 70B라면 이런 항목을 봅니다.</p>
+    <pre><code>{
+      "num_hidden_layers": 80,          // 레이어 수
+      "num_attention_heads": 64,        // Query 헤드 수 (KV 계산에 넣으면 안 됨)
+      "num_key_value_heads": 8,         // KV 헤드 수 (GQA)
+      "hidden_size": 8192,              // head_dim = 8192 / 64 = 128
+      "torch_dtype": "bfloat16"         // 파라미터당 2바이트
+    }</code></pre>
+    <p>파라미터 수는 모델 이름의 숫자(70B)가 아니라 모델 카드에 적힌 실제 값(70.6B 등)을 쓰는 게 정확합니다. 그리고 계산은 어디까지나 예측이라, 실제로 띄운 뒤 두 곳에서 맞춰 봅니다.</p>
+    <ul>
+    <li><strong>vLLM 기동 로그</strong>: 가중치가 차지한 메모리, KV cache로 잡힌 크기(토큰 수), 요청 길이 기준 최대 동시 처리 수가 찍힙니다. 계산값과 나란히 적어 두면 내 환경의 오버헤드가 얼마인지 거꾸로 알 수 있습니다.</li>
+    <li><strong><code>nvidia-smi</code></strong>: 프로세스별 실제 사용량을 봅니다. vLLM은 예산만큼 미리 잡아 두므로 요청이 없어도 거의 꽉 찬 것처럼 보이는 게 정상입니다.</li>
+    </ul>
+    <div class="callout info"><span class="label">이 글의 단위</span><p>이 글은 GB(10억 바이트)로 계산합니다. GPU 용량(80GB)도 같은 GB로 보고 근사했습니다. vLLM 로그와 <code>nvidia-smi</code>는 GiB(1024³ 바이트)나 MiB로 찍기 때문에, 같은 값이 약 7% 작게 보입니다. 예를 들어 BF16 70B의 가중치 140GB는 약 130GiB입니다.</p></div>
+
     <h2>Quantization</h2>
     <p>가중치(필요하면 활성값과 KV까지)를 더 적은 비트로 표현해 메모리와 대역폭을 줄이는 기법입니다. 선택 기준은 GPU 세대, 품질 허용치, 서빙 엔진 지원 여부 세 가지입니다.</p>
     <div class="callout info">
@@ -162,6 +225,10 @@
     <p>고화질 사진을 JPG로 압축하면 용량이 확 줄고, 눈으로 보면 거의 차이가 없습니다. 양자화도 같습니다. 숫자 하나를 16비트 대신 8비트나 4비트로 저장해서, 70B 모델이 140GB에서 70GB, 약 38.5GB로 줄어듭니다.</p>
     <p>다만 압축한 사진이 원본과 똑같은 사진은 아니듯, 많이 줄일수록 세부가 조금씩 뭉개집니다. 그래서 어떤 형식을 쓸 수 있는지는 GPU 세대가 정하고, 얼마나 줄여도 되는지는 실제 업무 질문으로 확인해서 정합니다.</p>
     </div>
+    <h3>양자화가 실제로 하는 일</h3>
+    <p>4비트 정수는 -8부터 7까지 16개 값만 표현할 수 있습니다. 그래서 가중치를 128개 정도씩 묶고, 묶음마다 "정수 1칸이 실제로 얼마인지"를 나타내는 스케일 값을 하나씩 따로 저장합니다. 쓸 때는 정수에 스케일을 곱해 원래 값에 가깝게 되돌립니다.</p>
+    <div class="formula">실제 가중치 ≈ 4비트 정수 × 묶음의 스케일<small>예: 스케일이 0.02인 묶음에서 정수 -3은 -0.06을 뜻합니다. 스케일도 메모리를 차지해서 INT4는 파라미터당 0.5가 아니라 약 0.55바이트가 됩니다.</small></div>
+    <p>AWQ, GPTQ 같은 W4A16 방식은 이렇게 저장만 4비트로 하고, 계산 직전에 16비트로 풀어서 원래대로 계산합니다. 그러니 계산량은 그대로인데 왜 빨라질까요? <a href="../llm-serving-runtime/">2편</a>에서 보겠지만 답을 한 글자씩 만드는 decode 단계는 계산이 아니라 GPU 메모리에서 가중치를 읽어 오는 속도에 묶여 있어서, 읽을 바이트가 1/4로 줄면 그만큼 빨라집니다. 반대로 FP8 W8A8은 계산 자체도 8비트로 해서, FP8 전용 연산 장치가 있는 Hopper·Ada에서 계산까지 빨라집니다.</p>
     <div class="table-wrap"><table>
     <tr><th>방식</th><th>비트</th><th>무엇을 줄이나</th><th>품질</th><th>맞는 GPU</th></tr>
     <tr><td>BF16 / FP16</td><td class="num">16</td><td>기준</td><td>원본</td><td>전부</td></tr>

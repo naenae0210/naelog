@@ -112,7 +112,43 @@
     <tr><td class="num">64+</td><td>Clearly longer</td><td>Flattens out</td><td>Approaching the compute or KV limit</td></tr>
     <tr><td>Past the KV limit</td><td>Wait time explodes</td><td>Stops rising</td><td>Queueing and preemption</td></tr>
     </table></div>
+    <figure class="figure">
+      <svg viewBox="0 0 700 270" role="img" aria-label="As concurrency grows, throughput rises then flattens while time per token bends upward" font-family="Pretendard Variable, Pretendard, sans-serif">
+        <g stroke="#d1d6db" stroke-width="1.5" fill="none"><path d="M60 20 v190 h580"/></g>
+        <path d="M60 200 C 160 110, 260 70, 380 58 S 560 52, 620 52" fill="none" stroke="#90c2ff" stroke-width="3"/>
+        <path d="M60 180 C 220 176, 340 168, 420 150 S 560 70, 620 34" fill="none" stroke="#8b95a1" stroke-width="3"/>
+        <path d="M470 20 v190" stroke="#b0b8c1" stroke-width="1.5" stroke-dasharray="4 4"/>
+        <circle cx="380" cy="58" r="8" fill="#3182f6"/>
+        <g font-size="12" fill="#4e5968">
+          <text x="340" y="250" text-anchor="middle">Concurrent requests →</text>
+          <text x="130" y="96" fill="#191f28" font-weight="700">Total throughput</text>
+          <text x="200" y="196" fill="#191f28" font-weight="700">Per-request TPOT</text>
+          <text x="478" y="232">KV limit: queueing from here</text>
+          <text x="290" y="40" font-weight="700" fill="#3182f6">Operating point</text>
+        </g>
+      </svg>
+      <figcaption>The best operating point is just before throughput flattens out and before TPOT climbs steeply. A conceptual diagram showing only the shape.</figcaption>
+    </figure>
     <p>This table shows the trend; the exact turning point differs by model, GPU and input/output length. Measure it yourself with <code>vllm bench serve</code> (<code>benchmark_serving.py</code> in older versions) while varying concurrency.</p>
+
+    <h3>Measuring it yourself</h3>
+    <p>Here is how to draw that curve for your own setup. vLLM ships a benchmark tool that applies load and measures the metrics. Run it several times at different concurrency levels and you get the curve.</p>
+    <pre><code># With the server running, send 200 requests of 1,024 input / 256 output tokens, 32 at a time
+    vllm bench serve \
+      --model meta-llama/Llama-3.1-70B-Instruct \
+      --dataset-name random --random-input-len 1024 --random-output-len 256 \
+      --num-prompts 200 --max-concurrency 32
+
+    # Repeat with --max-concurrency 1, 8, 16, 32, 64, 128 and collect
+    # Output token throughput, Mean/P99 TTFT and Mean/P99 TPOT into a table</code></pre>
+    <p>The input and output lengths only mean something if they resemble your real service: long inputs for a RAG service, long outputs for a summarization service. Option names can vary a little between vLLM versions, so check with <code>vllm bench serve --help</code>.</p>
+    <p>In production, the vLLM server exports Prometheus-format metrics at <code>/metrics</code>.</p>
+    <pre><code>$ curl -s localhost:8000/metrics | grep -E "num_requests_waiting|cache_usage|preemptions"
+    vllm:num_requests_running{...} 41
+    vllm:num_requests_waiting{...} 0
+    vllm:gpu_cache_usage_perc{...} 0.83
+    vllm:num_preemptions_total{...} 12</code></pre>
+    <p>TTFT and TPOT come as histograms (<code>vllm:time_to_first_token_seconds</code>, <code>vllm:time_per_output_token_seconds</code>), so compute p95 in Prometheus with <code>histogram_quantile(0.95, ...)</code> and put it on the dashboard. Metric names also change between versions (KV usage becoming <code>kv_cache_usage_perc</code>, for example), so it is safest to look at your version's <code>/metrics</code> output once and match it.</p>
     <h2>Handling concurrent requests</h2>
     <p>As users grow, things break in almost the same order every time.</p>
     <ol>
@@ -121,6 +157,9 @@
     <li><strong>Preemption</strong>: when running requests run out of KV, vLLM evicts some and later recomputes them from the start. Doing the same work twice drops throughput too. Check <code>vllm:num_preemptions_total</code></li>
     <li><strong>Timeouts</strong>: past the gateway's (nginx, Cloudflare etc.) wait limit you get 504. Users feel "the server is down"</li>
     </ol>
+    <h3>One long prompt can stall everyone else's text</h3>
+    <p>Some delay happens even without a queue. Every step, vLLM processes the running requests' decode and new requests' prefill together in one batch. When a 20,000-token RAG prompt arrives, its prefill holds one step for a long time, and meanwhile other users get no next token. To them, an answer that was flowing smoothly suddenly stutters.</p>
+    <p><a href="../llm-serving-runtime/">Part 2</a>'s chunked prefill reduces this. It cuts a long prefill into pieces slotted across several steps, and the cap on tokens per step is set with <code>--max-num-batched-tokens</code>. A small value keeps everyone else's TPOT even but lengthens the long request's own TTFT; a large value does the opposite. Go small when uninterrupted text matters, as in chat, and large when finishing in one go matters, as in document processing.</p>
     <h3>Sizing concurrency: Little's law</h3>
     <div class="formula">Concurrent requests = <b>requests per second</b> × <b>average time per request (s)</b></div>
     <p>It is the same formula as "people in the shop = people arriving per minute × time each one stays". If 2 requests arrive per second and each answer takes 15 seconds on average, 30 are always running at once. Those 30 × average tokens per request must fit in the KV budget for it to run without a queue.</p>
@@ -134,6 +173,7 @@
     <tr><td>Uneven load per user</td><td>Per-user concurrency limits at the gateway, an output token cap (<code>max_tokens</code>)</td></tr>
     </table></div>
     <p>TP and replicas serve different purposes. TP is for "a model that does not fit on one card"; if it fits, running several replicas on the same number of GPUs behind a load balancer usually gives better throughput because there is no GPU-to-GPU communication.</p>
+    <p>Keep in mind, though, that with replicas each server has its own KV cache. Prefix caching only helps within one server, so if requests sharing a system prompt or document scatter across replicas every time, the cache barely gets used. Configure the load balancer to send requests to the same replica by conversation session or common prefix, and TTFT can drop a lot.</p>
     <h2>Back to a real case</h2>
     <h3>Going from 10 users to 100</h3>
     <p>Assume two H100s, 70B FP8, and 4K tokens per request on average. With a KV budget of about 400,000 tokens, 4K requests top out at a little over 100 concurrent.</p>

@@ -112,6 +112,40 @@
     <p>In other words, every new token needs <strong>the Keys and Values of all earlier tokens</strong>. Recomputing them each time would be wasteful, so the Transformer stores the Key and Value of every processed token in every layer and reuses them. That storage is the <strong>KV cache</strong>, the conversation notepad in the analogy above. Each of the 80 layers makes its own Keys and Values, which is why the formula below multiplies by the number of layers. And the longer the conversation, the thicker the notepad; the more users, the more notepads, so the total grows with length and user count.</p>
     <div class="formula">KV per token = 2(K,V) × <b>layers</b> × <b>KV heads</b> × <b>head dim</b> × <b>bytes</b></div>
     <p>For Llama 3.1 70B (80 layers, 8 KV heads, head dim 128, BF16) that is <code>2×80×8×128×2 = 327,680 B</code> per token, about 0.33MB.</p>
+    <figure class="figure">
+      <svg viewBox="0 0 700 250" role="img" aria-label="KV cache: K and V per token stacked in every layer" font-family="Pretendard Variable, Pretendard, sans-serif">
+        <g font-size="12" fill="#4e5968">
+          <text x="0" y="16" font-size="13" font-weight="700" fill="#191f28">Tokens →</text>
+          <text x="90" y="16">Alice</text><text x="170" y="16">bought</text><text x="250" y="16">apples</text><text x="330" y="16">.</text><text x="410" y="16">She</text>
+          <text x="490" y="16" font-weight="700" fill="#3182f6">New token</text>
+          <text x="0" y="52">Layer 1</text><text x="0" y="96">Layer 2</text><text x="0" y="140">Layer 3</text><text x="0" y="176">⋮</text><text x="0" y="214">Layer 80</text>
+        </g>
+        <g fill="#fff" stroke="#e5e8eb">
+          <rect x="80" y="32" width="70" height="30" rx="6"/><rect x="160" y="32" width="70" height="30" rx="6"/><rect x="240" y="32" width="70" height="30" rx="6"/><rect x="320" y="32" width="70" height="30" rx="6"/><rect x="400" y="32" width="70" height="30" rx="6"/>
+          <rect x="80" y="76" width="70" height="30" rx="6"/><rect x="160" y="76" width="70" height="30" rx="6"/><rect x="240" y="76" width="70" height="30" rx="6"/><rect x="320" y="76" width="70" height="30" rx="6"/><rect x="400" y="76" width="70" height="30" rx="6"/>
+          <rect x="80" y="120" width="70" height="30" rx="6"/><rect x="160" y="120" width="70" height="30" rx="6"/><rect x="240" y="120" width="70" height="30" rx="6"/><rect x="320" y="120" width="70" height="30" rx="6"/><rect x="400" y="120" width="70" height="30" rx="6"/>
+          <rect x="80" y="194" width="70" height="30" rx="6"/><rect x="160" y="194" width="70" height="30" rx="6"/><rect x="240" y="194" width="70" height="30" rx="6"/><rect x="320" y="194" width="70" height="30" rx="6"/><rect x="400" y="194" width="70" height="30" rx="6"/>
+        </g>
+        <g fill="#3182f6">
+          <rect x="480" y="32" width="70" height="30" rx="6"/><rect x="480" y="76" width="70" height="30" rx="6"/><rect x="480" y="120" width="70" height="30" rx="6"/><rect x="480" y="194" width="70" height="30" rx="6"/>
+        </g>
+        <g font-size="12" text-anchor="middle" fill="#4e5968">
+          <text x="115" y="52">K V</text><text x="195" y="52">K V</text><text x="275" y="52">K V</text><text x="355" y="52">K V</text><text x="435" y="52">K V</text>
+          <text x="115" y="96">K V</text><text x="195" y="96">K V</text><text x="275" y="96">K V</text><text x="355" y="96">K V</text><text x="435" y="96">K V</text>
+          <text x="115" y="140">K V</text><text x="195" y="140">K V</text><text x="275" y="140">K V</text><text x="355" y="140">K V</text><text x="435" y="140">K V</text>
+          <text x="115" y="214">K V</text><text x="195" y="214">K V</text><text x="275" y="214">K V</text><text x="355" y="214">K V</text><text x="435" y="214">K V</text>
+          <g fill="#fff" font-weight="700"><text x="515" y="52">K V</text><text x="515" y="96">K V</text><text x="515" y="140">K V</text><text x="515" y="214">K V</text></g>
+        </g>
+        <g font-size="12" fill="#4e5968">
+          <text x="570" y="96">Every new token</text>
+          <text x="570" y="116">adds one K, V slot</text>
+          <text x="570" y="136">in all 80 layers</text>
+        </g>
+      </svg>
+      <figcaption>The KV cache is a table of "layers × tokens". One table per request, and as many tables as there are concurrent requests.</figcaption>
+    </figure>
+    <p>The "KV heads" in that formula needs one explanation. Llama 3.1 70B has 64 attention heads but only 8 KV heads. That is because of <strong>GQA (Grouped Query Attention)</strong>, used by most models today: groups of 8 query heads share one key/value head, which cuts the KV cache to 1/8 with almost no loss in quality. What gets stored is keys and values, not queries, so the KV head count is what goes into the math.</p>
+    <div class="callout warn-box"><span class="label">A common mistake</span><p>Put <code>num_attention_heads</code> (64 for 70B) in place of the KV heads and the KV cache comes out 8 times too large. Always use <code>num_key_value_heads</code>. Conversely, older models without GQA have the two values equal, so their KV cache is much larger at the same size.</p></div>
     <div class="table-wrap"><table>
     <tr><th>70B, BF16 KV</th><th>1 request</th><th>16 concurrent</th><th>64 concurrent</th></tr>
     <tr><td>4K context</td><td class="num">1.3 GB</td><td class="num">21 GB</td><td class="num">86 GB</td></tr>
@@ -119,6 +153,19 @@
     <tr><td>32K context</td><td class="num">10.7 GB</td><td class="num">172 GB</td><td class="num">687 GB</td></tr>
     </table></div>
     <p>One 8K conversation is 2.7GB, but 64 people at once is 172GB. Even if the weights just barely fit, there is no service without room for the notepads. Put the other way: securing enough KV space is what concurrency is.</p>
+    <figure class="figure">
+      <svg viewBox="0 0 700 220" role="img" aria-label="70B BF16 KV cache size at 8K tokens by number of concurrent requests, compared with one 80GB card" font-family="Pretendard Variable, Pretendard, sans-serif">
+        <text x="0" y="16" fill="#4e5968" font-size="13" font-weight="600">70B, BF16 KV, 8K tokens per request · 700px bar = 180GB</text>
+        <g font-size="13" fill="#4e5968">
+          <text x="0" y="58">1 user</text><rect x="60" y="42" width="11" height="24" rx="4" fill="#90c2ff"/><text x="80" y="59">2.7GB</text>
+          <text x="0" y="102">16</text><rect x="60" y="86" width="167" height="24" rx="4" fill="#90c2ff"/><text x="236" y="103">43GB</text>
+          <text x="0" y="146">64</text><rect x="60" y="130" width="600" height="24" rx="4" fill="#3182f6"/><text x="606" y="147" fill="#fff" font-weight="700">172GB</text>
+        </g>
+        <path d="M371 32 v134" stroke="#8b95a1" stroke-width="1.5" stroke-dasharray="4 4"/>
+        <text x="378" y="186" font-size="12" fill="#4e5968">One whole GPU, 80GB</text>
+        <text x="0" y="210" font-size="12" fill="#8b95a1">Before counting weights, the KV for 64 users alone exceeds two 80GB cards.</text>
+      </svg>
+    </figure>
 
     <h3>Overhead: the 2 to 4GB people forget</h3>
     <ul>
@@ -155,6 +202,22 @@
       <figcaption>What is left after weights and overhead is the KV cache, which is how many users you can take at once.</figcaption>
     </figure>
 
+    <h3>Where to find the numbers, and how to check them</h3>
+    <p>Every value the math needs is in the model repository's <code>config.json</code> on Hugging Face. For Llama 3.1 70B you look at these fields.</p>
+    <pre><code>{
+      "num_hidden_layers": 80,          // layers
+      "num_attention_heads": 64,        // query heads (do not use for KV)
+      "num_key_value_heads": 8,         // KV heads (GQA)
+      "hidden_size": 8192,              // head_dim = 8192 / 64 = 128
+      "torch_dtype": "bfloat16"         // 2 bytes per parameter
+    }</code></pre>
+    <p>For the parameter count, the actual value on the model card (70.6B, say) is more accurate than the number in the name (70B). And the math is only a prediction, so once the model is running, check it against two places.</p>
+    <ul>
+    <li><strong>vLLM startup log</strong>: shows the memory taken by weights, the size reserved for KV cache (in tokens), and the maximum concurrency for the request length. Write it next to your calculation and you can work out your environment's overhead in reverse.</li>
+    <li><strong><code>nvidia-smi</code></strong>: shows actual usage per process. vLLM reserves its budget up front, so looking almost full with no requests is normal.</li>
+    </ul>
+    <div class="callout info"><span class="label">Units in this post</span><p>This post calculates in GB (a billion bytes) and approximates the GPU capacity (80GB) in the same GB. vLLM logs and <code>nvidia-smi</code> print GiB (1024³ bytes) or MiB, so the same value looks about 7% smaller. For example, the 140GB of BF16 70B weights is about 130GiB.</p></div>
+
     <h2>Quantization</h2>
     <p>A technique that represents weights (and, if needed, activations and KV) in fewer bits to cut memory and bandwidth. You choose based on three things: GPU generation, how much quality loss you can accept, and what the serving engine supports.</p>
     <div class="callout info">
@@ -162,6 +225,10 @@
     <p>Compress a high-resolution photo to JPG and the file shrinks a lot while looking almost the same. Quantization is the same idea: store each number in 8 or 4 bits instead of 16, and a 70B model shrinks from 140GB to 70GB, or about 38.5GB.</p>
     <p>But a compressed photo is not the original, and the more you shrink it the more the detail blurs. So the GPU generation decides which formats you can use, and real work questions decide how far you can shrink.</p>
     </div>
+    <h3>What quantization actually does</h3>
+    <p>A 4-bit integer can only represent 16 values, from -8 to 7. So the weights are grouped about 128 at a time, and each group stores one separate scale value meaning "how much one integer step is really worth". When used, the integer is multiplied by the scale to get back close to the original value.</p>
+    <div class="formula">Actual weight ≈ 4-bit integer × the group's scale<small>For example, in a group with scale 0.02, the integer -3 means -0.06. Scales take memory too, so INT4 is about 0.55 bytes per parameter rather than 0.5.</small></div>
+    <p>W4A16 methods like AWQ and GPTQ store only in 4 bits this way, and unpack to 16 bits right before computing as usual. So the amount of computation is unchanged; why does it get faster? As <a href="../llm-serving-runtime/">part 2</a> shows, the decode step that writes the answer one token at a time is bound not by computation but by how fast weights are read from GPU memory, so cutting the bytes to read to 1/4 speeds it up by about that much. FP8 W8A8, by contrast, also computes in 8 bits, so on Hopper and Ada with dedicated FP8 units the computation gets faster too.</p>
     <div class="table-wrap"><table>
     <tr><th>Method</th><th>Bits</th><th>What it shrinks</th><th>Quality</th><th>GPUs</th></tr>
     <tr><td>BF16 / FP16</td><td class="num">16</td><td>Baseline</td><td>Original</td><td>All</td></tr>
