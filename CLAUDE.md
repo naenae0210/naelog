@@ -58,6 +58,7 @@ Astro 정적 사이트이고 GitHub Pages로 배포한다. 저장소는 `naenae0
 - 시리즈 글은 `<meta name="post:series" content="시리즈 이름">`과 `<meta name="post:part" content="n">`을 둔다. 목록과 제목 위 작은 줄에 "LLM 서빙 1편"처럼 나온다. 제목에는 번호를 넣지 않고, 위쪽에 `.series`(편 목록), 아래쪽에 `.series-pager`(이전/다음 편)를 둔다. 예: `public/posts/llm-serving-*`.
 - em dash(—)는 쓰지 않는다. 콜론, 쉼표, 하이픈을 쓴다.
 - 제목과 소제목에 번호를 붙이지 않는다.
+- 제목은 글에 가장 잘 맞는 것을 먼저 찾는다. 질문형은 글이 하나의 질문에 답하고 그 질문이 독자를 끌어당길 때만 쓰고, 항상 질문으로 만들 필요는 없다.
 - 메모리 단위는 GiB로 통일한다.
 - 계산값과 실측값을 구분해서 적는다. 가정은 캡션이나 콜아웃에 밝힌다.
 - 아래 dev 규칙(GiB, 계산값/실측값, 다섯 가지 질문)은 dev 글에만 해당한다. book, scrap의 인용과 발췌는 원문 그대로 옮기고 고치지 않는다(원문의 em dash도 그대로 둔다).
@@ -71,6 +72,6 @@ Astro 정적 사이트이고 GitHub Pages로 배포한다. 저장소는 `naenae0
 - 구조, 숫자, 그림, 계산기는 한국어판과 똑같이 두고 글자만 옮긴다. SVG 안 글자가 길어지면 좌표만 조정한다.
 - `<html lang="en">`, 경로는 `../../../assets/...`. 헤더는 로고가 `../../`(영어 목록), nav는 `../../dev/`, `../../book/`, `../../scrap/`(영어 목록)이다.
 - 두 파일이 서로 가리키게 한다. 한국어판에 `<link rel="alternate" hreflang="en" href="../../en/posts/<slug>/" />`, 영어판에 `<link rel="alternate" hreflang="ko" href="../../../posts/<slug>/" />`.
-- 영어 제목은 첫 글자만 대문자(sentence case)로 쓰고, 한국어판처럼 콜론으로 앞뒤를 나눈다. 고유명사와 약어(GPU, MinIO, vLLM)는 원래 표기대로. 예: `Why doesn't 70B fit on one A100: GPU memory and quantization`
+- 영어 제목은 첫 글자만 대문자(sentence case)로 쓰고, 한국어판처럼 콜론으로 앞뒤를 나눈다. 고유명사와 약어(GPU, MinIO, vLLM)는 원래 표기대로. 질문 형태를 쓸 때는 물음표 없이 간접의문 어순으로 쓴다. 예: `Why 70B doesn't fit on one A100: GPU memory and quantization`
 - `post:category`는 한국어판과 같은 영어 이름을 그대로 쓴다. 계산기 문구와 숫자 표기(만 → k)도 영어로 바꾼다.
 - 영어도 em dash를 쓰지 않고, 단위는 GiB다. 한국어판을 고치면 영어판도 같이 고친다.
