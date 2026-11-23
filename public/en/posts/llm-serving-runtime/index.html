@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Why Do Answers Come Out One Token at a Time? CUDA, Decode, vLLM · naelog</title>
+  <title>Why do answers come out one token at a time: CUDA, decode, vLLM · naelog</title>
   <meta name="description" content="Part 2 of the LLM serving notes: CUDA and driver layers, prefill and decode, and vLLM PagedAttention and continuous batching." />
   <!-- 홈 목록에 쓰이는 정보 -->
   <meta name="post:log" content="dev" />
   <meta name="post:date" content="2026-11-23" />
   <meta name="post:series" content="LLM Serving" />
   <meta name="post:part" content="2" />
-  <meta name="post:category" content="GPU &amp; Inference" />
+  <meta name="post:category" content="AI Infra" />
   <meta name="post:tags" content="LLM Serving, CUDA, vLLM" />
   <link rel="stylesheet" href="../../../assets/naedevlog.css" />
   <link rel="alternate" hreflang="ko" href="../../../posts/llm-serving-runtime/" />
@@ -33,7 +33,7 @@
 
   <main class="wrap">
     <div class="category">LLM Serving · Part 2</div>
-    <h1>Why Do Answers Come Out One Token at a Time? CUDA, Decode, vLLM</h1>
+    <h1>Why do answers come out one token at a time: CUDA, decode, vLLM</h1>
     <p class="lead">Once the model fits in memory, it is time to follow one request through the GPU until it becomes an answer.</p>
     <div class="post-meta">
       <span>2026.11.23</span><span class="dot"></span><span>15 min</span>

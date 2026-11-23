@@ -25,7 +25,7 @@ Astro 정적 사이트이고 GitHub Pages로 배포한다. 저장소는 `naenae0
 1. 로그에 맞는 템플릿을 `public/posts/<slug>/index.html`로 복사한다. slug는 영어 소문자와 하이픈.
 2. `<head>`의 `post:*` 메타를 채운다.
    - `post:log`: `dev`, `book`, `scrap` 중 하나. 없으면 `dev`로 본다. 템플릿에 이미 맞춰져 있다(헤더 nav의 `aria-current`, 푸터 `naelog · <로그>`).
-   - `post:category`: dev는 주제(GPU와 추론, 모니터링, 인프라와 배포, RAG와 데이터), book은 저자, scrap은 매체. 기존 글과 같은 표기를 쓴다.
+   - `post:category`: dev는 주제 `AI Infra`, `OS`, `Network`, `Data` 중 하나(Data는 DB, 벡터 DB, 스토리지처럼 데이터를 저장하고 꺼내는 시스템). 한국어판과 영어판에 같은 영어 이름을 쓴다. 넷에 맞지 않는 글이 생기면 새 주제를 정하고 여기에 더한다. book은 저자, scrap은 매체.
    - `post:tags`: 쉼표로 나눈다. 태그 안에 쉼표가 있으면 `\,`로 쓴다 (예: `Peau noire\, masques blancs`).
    - `post:date`: YYYY-MM-DD. 이 날짜 순으로 홈에 정렬된다.
    - 아직 공개하지 않을 글은 `post:draft`를 `true`로 둔다.
@@ -71,5 +71,6 @@ Astro 정적 사이트이고 GitHub Pages로 배포한다. 저장소는 `naenae0
 - 구조, 숫자, 그림, 계산기는 한국어판과 똑같이 두고 글자만 옮긴다. SVG 안 글자가 길어지면 좌표만 조정한다.
 - `<html lang="en">`, 경로는 `../../../assets/...`. 헤더는 로고가 `../../`(영어 목록), nav는 `../../dev/`, `../../book/`, `../../scrap/`(영어 목록)이다.
 - 두 파일이 서로 가리키게 한다. 한국어판에 `<link rel="alternate" hreflang="en" href="../../en/posts/<slug>/" />`, 영어판에 `<link rel="alternate" hreflang="ko" href="../../../posts/<slug>/" />`.
-- `post:category`는 영어 이름을 쓴다(예: GPU와 추론 → GPU &amp; Inference). 계산기 문구와 숫자 표기(만 → k)도 영어로 바꾼다.
+- 영어 제목은 첫 글자만 대문자(sentence case)로 쓰고, 한국어판처럼 콜론으로 앞뒤를 나눈다. 고유명사와 약어(GPU, MinIO, vLLM)는 원래 표기대로. 예: `Why doesn't 70B fit on one A100: GPU memory and quantization`
+- `post:category`는 한국어판과 같은 영어 이름을 그대로 쓴다. 계산기 문구와 숫자 표기(만 → k)도 영어로 바꾼다.
 - 영어도 em dash를 쓰지 않고, 단위는 GiB다. 한국어판을 고치면 영어판도 같이 고친다.
